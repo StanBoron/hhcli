@@ -1,15 +1,17 @@
 from __future__ import annotations
-from typing import Any, Dict, Iterator, List, Optional
+
+from collections.abc import Iterator
+from typing import Any
 
 
-def format_salary(salary: Optional[Dict[str, Any]]) -> str:
+def format_salary(salary: dict[str, Any] | None) -> str:
     if not salary:
         return ""
     f = salary.get("from")
     t = salary.get("to")
     cur = salary.get("currency")
     gross = salary.get("gross")
-    parts: List[str] = []
+    parts: list[str] = []
     if f:
         parts.append(f"от {f}")
     if t:
@@ -25,8 +27,8 @@ def paginate_vacancies(
     fetch_page_fn,
     *,
     per_page: int = 100,
-    limit: Optional[int] = None,
-) -> Iterator[Dict[str, Any]]:
+    limit: int | None = None,
+) -> Iterator[dict[str, Any]]:
     """
     Итератор по всем вакансиям.
 

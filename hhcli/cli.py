@@ -3,27 +3,27 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Optional, List
+from typing import Annotated
 
 import typer
 
-from .config import load_config, save_config
+from .api import areas, dictionaries, employers, professional_roles, resumes, vacancies
 from .auth import build_oauth_url, exchange_code, refresh_token
+from .config import load_config, save_config
 from .utils import format_salary, paginate_vacancies
-from .api import vacancies, employers, areas, resumes
-from .api import professional_roles, dictionaries
 
 # создаём Typer-приложение
 app = typer.Typer(add_completion=False)
 
 # -------------------- Config & OAuth --------------------
 
+
 @app.command("config")
 def configure(
-    client_id: Optional[str] = typer.Option(None),
-    client_secret: Optional[str] = typer.Option(None),
-    redirect_uri: Optional[str] = typer.Option(None),
-    user_agent: Optional[str] = typer.Option(None),
+    client_id: str | None = typer.Option(None),
+    client_secret: str | None = typer.Option(None),
+    redirect_uri: str | None = typer.Option(None),
+    user_agent: str | None = typer.Option(None),
 ):
     """Сохранить client_id, secret и т.п. в конфиг"""
     cfg = load_config()
@@ -58,10 +58,16 @@ def oauth_refresh():
     refresh_token()
     typer.echo("Access token refreshed.")
 
+
 # -------------------- Reference/Lookup --------------------
 
+
 @app.command("areas")
-def cmd_areas(parent: Optional[int] = typer.Option(None, help="Показать детей для узла area_id (например, 113 = Россия)")):
+def cmd_areas(
+    parent: int | None = typer.Option(
+        None, help="Показать детей для узла area_id (например, 113 = Россия)"
+    )
+):
     """Вывести страны/регионы верхнего уровня или детей узла --parent"""
     if parent is None:
         data = areas.get_areas_tree()
@@ -73,6 +79,7 @@ def cmd_areas(parent: Optional[int] = typer.Option(None, help="Показать 
         for child in node.get("areas", []):
             typer.echo(f"{child['id']}\t{child['name']}")
 
+
 @app.command("roles")
 def cmd_roles():
     """Список professional_roles (id и названия)."""
@@ -81,6 +88,7 @@ def cmd_roles():
         typer.echo(f"[{group['id']}] {group['name']}")
         for r in group.get("roles", []):
             typer.echo(f"  {r['id']}\t{r['name']}")
+
 
 @app.command("dicts")
 def cmd_dicts():
@@ -91,11 +99,13 @@ def cmd_dicts():
     for s in sched:
         typer.echo(f"  {s['id']}\t{s['name']}")
 
+
 @app.command("employer")
 def cmd_employer(employer_id: str):
     """Инфо о работодателе"""
     data = employers.get_employer(employer_id)
     typer.echo(json.dumps(data, ensure_ascii=False, indent=2))
+
 
 @app.command("vacancy")
 def cmd_vacancy(vacancy_id: str):
@@ -103,20 +113,31 @@ def cmd_vacancy(vacancy_id: str):
     data = vacancies.get_vacancy(vacancy_id)
     typer.echo(json.dumps(data, ensure_ascii=False, indent=2))
 
+
 # -------------------- Search --------------------
 
+
+@app.command("search")
 @app.command("search")
 def cmd_search(
-    text: str = typer.Option(""),
-    area: Optional[int] = typer.Option(None),
-    experience: Optional[str] = typer.Option(None, help="noExperience, between1And3, between3And6, moreThan6"),
-    salary: Optional[int] = typer.Option(None),
-    only_with_salary: bool = typer.Option(False),
-    page: int = typer.Option(0),
-    per_page: int = typer.Option(20),
-    role: Optional[List[int]] = typer.Option(None, help="id роли (можно повторять опцию несколько раз)"),
-    schedule: Optional[str] = typer.Option(None, help="id из словаря schedule (см. hhcli dicts)"),
-    save_json: Optional[str] = typer.Option(None),
+    text: Annotated[str, typer.Option(help="Строка поиска")] = "",
+    area: Annotated[int | None, typer.Option(help="area id (например, 1 = Москва)")] = None,
+    experience: Annotated[
+        str | None, typer.Option(help="noExperience|between1And3|between3And6|moreThan6")
+    ] = None,
+    salary: Annotated[int | None, typer.Option(help="Желаемая зарплата (фильтр)")] = None,
+    only_with_salary: Annotated[bool, typer.Option(help="Только с указанием зарплаты")] = False,
+    page: Annotated[int, typer.Option(help="Номер страницы (0..)")] = 0,
+    per_page: Annotated[int, typer.Option(help="Размер страницы (до 100)")] = 20,
+    role: Annotated[
+        list[int] | None, typer.Option(help="id проф. роли (можно повторять опцию)")
+    ] = None,
+    schedule: Annotated[
+        str | None, typer.Option(help="id из словаря schedule (см. `hhcli dicts`)")
+    ] = None,
+    save_json: Annotated[
+        str | None, typer.Option(help="Сохранить сырой ответ поиска в файл JSON")
+    ] = None,
 ):
     """Поиск вакансий"""
     params = {
@@ -141,23 +162,28 @@ def cmd_search(
         emp = (v.get("employer") or {}).get("name", "")
         typer.echo(f"{v['id']}\t{v['name']}\t{emp}\t{sal}")
 
+
 # -------------------- Export --------------------
+
 
 @app.command("export")
 def cmd_export(
-    text: str = typer.Option(""),
-    area: Optional[int] = typer.Option(None),
-    experience: Optional[str] = typer.Option(None),
-    salary: Optional[int] = typer.Option(None),
-    only_with_salary: bool = typer.Option(False),
-    per_page: int = typer.Option(100, help="до 100"),
-    limit: Optional[int] = typer.Option(None, help="макс. вакансий для экспорта"),
-    out: str = typer.Option("vacancies.csv"),
-    role: Optional[List[int]] = typer.Option(None, help="id роли (можно повторять опцию)"),
-    schedule: Optional[str] = typer.Option(None, help="id из словаря schedule"),
-    fmt: str = typer.Option("csv", help="Формат: csv|jsonl|parquet"),
+    text: Annotated[str, typer.Option(help="Строка поиска")] = "",
+    area: Annotated[int | None, typer.Option(help="area id")] = None,
+    experience: Annotated[
+        str | None, typer.Option(help="noExperience|between1And3|between3And6|moreThan6")
+    ] = None,
+    salary: Annotated[int | None, typer.Option(help="Желаемая зарплата (фильтр)")] = None,
+    only_with_salary: Annotated[bool, typer.Option(help="Только с указанием зарплаты")] = False,
+    per_page: Annotated[int, typer.Option(help="до 100")] = 100,
+    limit: Annotated[int | None, typer.Option(help="макс. вакансий для экспорта")] = None,
+    out: Annotated[str, typer.Option(help="Путь к файлу вывода")] = "vacancies.csv",
+    role: Annotated[list[int] | None, typer.Option(help="id роли (можно повторять опцию)")] = None,
+    schedule: Annotated[str | None, typer.Option(help="id из словаря schedule")] = None,
+    fmt: Annotated[str, typer.Option(help="Формат: csv|jsonl|parquet")] = "csv",
 ):
     """Выгрузить вакансии в CSV/JSONL/Parquet"""
+
     def fetch(page: int, per_page_: int):
         return vacancies.search_vacancies(
             text=text,
@@ -171,34 +197,39 @@ def cmd_export(
             schedule=schedule,
         )
 
-    rows: List[dict] = []
-    count = 0
-    for v in paginate_vacancies(fetch, per_page=per_page, limit=limit):
-        rows.append({
-            "id": v.get("id", ""),
-            "name": v.get("name", ""),
-            "employer": (v.get("employer") or {}).get("name", ""),
-            "salary": format_salary(v.get("salary")),
-            "area": (v.get("area") or {}).get("name", ""),
-            "published_at": v.get("published_at", ""),
-            "alternate_url": v.get("alternate_url", ""),
-        })
-        count += 1
-        if count % 100 == 0:
-            typer.echo(f"... собрали {count}")
+    rows: list[dict] = []
+    for idx, v in enumerate(paginate_vacancies(fetch, per_page=per_page, limit=limit), start=1):
+        rows.append(
+            {
+                "id": v.get("id", ""),
+                "name": v.get("name", ""),
+                "employer": (v.get("employer") or {}).get("name", ""),
+                "salary": format_salary(v.get("salary")),
+                "area": (v.get("area") or {}).get("name", ""),
+                "published_at": v.get("published_at", ""),
+                "alternate_url": v.get("alternate_url", ""),
+            }
+        )
+        if idx % 100 == 0:
+            typer.echo(f"... собрали {idx}")
 
     path = Path(out)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fmt_l = fmt.lower()
     if fmt_l == "jsonl":
-        path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+        path.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8"
+        )
     elif fmt_l == "parquet":
         try:
             import pandas as pd  # type: ignore
         except Exception:
-            typer.secho("Для Parquet нужен пакет pandas/pyarrow: pip install pandas pyarrow", fg=typer.colors.RED)
-            raise typer.Exit(2)
+            typer.secho(
+                "Для Parquet нужен пакет pandas/pyarrow: pip install pandas pyarrow",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(2) from None
         df = pd.DataFrame(rows)
         df.to_parquet(path, index=False)
     else:
@@ -215,11 +246,13 @@ def cmd_export(
 
 # -------------------- Applicant --------------------
 
+
 @app.command("my-resumes")
 def cmd_my_resumes():
     """Список резюме текущего пользователя"""
     data = resumes.my_resumes()
     typer.echo(json.dumps(data, ensure_ascii=False, indent=2))
+
 
 @app.command("can-respond")
 def cmd_can_respond(vacancy_id: str):
@@ -227,10 +260,11 @@ def cmd_can_respond(vacancy_id: str):
     data = vacancies.vacancy_resumes(vacancy_id)
     typer.echo(json.dumps(data, ensure_ascii=False, indent=2))
 
+
 @app.command("me")
 def cmd_me():
     """Кто я (/me) — проверка токена"""
     from .http import request
+
     data = request("GET", "/me", auth=True)
     typer.echo(json.dumps(data, ensure_ascii=False, indent=2))
-

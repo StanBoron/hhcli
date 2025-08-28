@@ -1,12 +1,13 @@
 from __future__ import annotations
+
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 CONFIG_PATH = Path(os.path.expanduser("~")) / ".hhcli" / "config.json"
 
-DEFAULTS: Dict[str, Any] = {
+DEFAULTS: dict[str, Any] = {
     "client_id": "",
     "client_secret": "",
     "redirect_uri": "http://localhost:8501",
@@ -16,12 +17,14 @@ DEFAULTS: Dict[str, Any] = {
     "user_agent": "hhcli/0.1 (+https://example.local)",
 }
 
+
 def ensure_config_dir() -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(json.dumps(DEFAULTS, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def load_config() -> Dict[str, Any]:
+
+def load_config() -> dict[str, Any]:
     ensure_config_dir()
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -40,12 +43,15 @@ def load_config() -> Dict[str, Any]:
     merged.update(env_overlay)
     return merged
 
-def save_config(cfg: Dict[str, Any]) -> None:
+
+def save_config(cfg: dict[str, Any]) -> None:
     ensure_config_dir()
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
 def get_user_agent() -> str:
     return load_config().get("user_agent", DEFAULTS["user_agent"]) or DEFAULTS["user_agent"]
+
 
 def get_access_token() -> str:
     return load_config().get("access_token", "")

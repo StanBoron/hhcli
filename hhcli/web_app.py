@@ -1,23 +1,25 @@
 from __future__ import annotations
 
 import io
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from hhcli.api import vacancies, areas as areas_api, professional_roles, dictionaries, resumes
-from hhcli.utils import format_salary, paginate_vacancies
-from hhcli.config import load_config, save_config
+from hhcli.api import areas as areas_api
+from hhcli.api import dictionaries, professional_roles, resumes, vacancies
 from hhcli.auth import build_oauth_url, exchange_code
+from hhcli.config import load_config, save_config
 from hhcli.http import request  # для /me
+from hhcli.utils import format_salary, paginate_vacancies
 
 st.set_page_config(page_title="HH.ru Search", layout="wide")
 
 # ========================= Caching of dictionaries =========================
 
+
 @st.cache_data(show_spinner=False)
-def get_roles_cache() -> List[Dict[str, Any]]:
+def get_roles_cache() -> list[dict[str, Any]]:
     data = professional_roles.get_roles()
     roles_flat = []
     for group in data.get("categories", []):
@@ -25,29 +27,33 @@ def get_roles_cache() -> List[Dict[str, Any]]:
             roles_flat.append({"id": int(r["id"]), "name": r["name"], "group": group["name"]})
     return roles_flat
 
+
 @st.cache_data(show_spinner=False)
-def get_schedules_cache() -> List[Dict[str, str]]:
+def get_schedules_cache() -> list[dict[str, str]]:
     data = dictionaries.get_dictionaries()
     sched = data.get("schedule", []) or []
     return [{"id": s["id"], "name": s["name"]} for s in sched]
 
+
 @st.cache_data(show_spinner=False)
-def get_area_children(area_id: Optional[int]) -> List[Dict[str, Any]]:
+def get_area_children(area_id: int | None) -> list[dict[str, Any]]:
     if area_id is None:
         return areas_api.get_areas_tree()
     node = areas_api.get_area_node(area_id)
     return node.get("areas", [])
 
+
 # ========================= Search helpers =========================
+
 
 def search_dataframe(
     *,
     text: str,
-    area: Optional[int],
-    roles: Optional[List[int]],
-    schedule: Optional[str],
+    area: int | None,
+    roles: list[int] | None,
+    schedule: str | None,
     per_page: int,
-    limit: Optional[int],
+    limit: int | None,
 ) -> pd.DataFrame:
     def fetch(page: int, per_page_: int):
         return vacancies.search_vacancies(
@@ -77,7 +83,8 @@ def search_dataframe(
         )
     return pd.DataFrame(rows)
 
-def df_to_download(df: pd.DataFrame, fmt: str) -> Tuple[Optional[bytes], str, str]:
+
+def df_to_download(df: pd.DataFrame, fmt: str) -> tuple[bytes | None, str, str]:
     """
     Возвращает (data_bytes, mime, filename) для выбранного формата.
     fmt: 'CSV' | 'JSONL' | 'Parquet'
@@ -102,9 +109,11 @@ def df_to_download(df: pd.DataFrame, fmt: str) -> Tuple[Optional[bytes], str, st
         return buf.getvalue(), "application/octet-stream", "vacancies.parquet"
     return None, "", ""
 
+
 # ========================= UI helpers =========================
 
-def area_picker(label: str) -> Optional[int]:
+
+def area_picker(label: str) -> int | None:
     """
     Простой «двухуровневый» выбор area: страна -> регионы/города.
     """
@@ -119,12 +128,16 @@ def area_picker(label: str) -> Optional[int]:
     if not children:
         return country_id
     ch_map = {f"{c['name']} ({c['id']})": int(c["id"]) for c in children}
-    ch_label = st.selectbox("Регион/город", [""] + list(ch_map.keys()), index=0, key="region_select")
+    ch_label = st.selectbox(
+        "Регион/город", [""] + list(ch_map.keys()), index=0, key="region_select"
+    )
     if not ch_label:
         return country_id
     return ch_map[ch_label]
 
+
 # ========================= OAuth block =========================
+
 
 def oauth_ui():
     st.subheader("Вход в hh.ru (OAuth)")
@@ -134,9 +147,13 @@ def oauth_ui():
     with col1:
         client_id = st.text_input("Client ID", value=cfg.get("client_id", ""), type="default")
     with col2:
-        client_secret = st.text_input("Client Secret", value=cfg.get("client_secret", ""), type="password")
+        client_secret = st.text_input(
+            "Client Secret", value=cfg.get("client_secret", ""), type="password"
+        )
     with col3:
-        redirect_uri = st.text_input("Redirect URI", value=cfg.get("redirect_uri", "http://localhost:8501"))
+        redirect_uri = st.text_input(
+            "Redirect URI", value=cfg.get("redirect_uri", "http://localhost:8501")
+        )
 
     if st.button("Сохранить настройки OAuth"):
         cfg["client_id"] = client_id.strip()
@@ -198,26 +215,36 @@ def oauth_ui():
             except Exception as e:
                 st.error(f"Ошибка запроса резюме: {e}")
 
+
 # ========================= Main =========================
+
 
 def main():
     st.title("HH.ru — Web Search (Streamlit)")
 
     with st.sidebar:
         st.header("Фильтры")
-        text = st.text_input("Поисковая строка", value="Python", placeholder="например: Backend, Java, Data Engineer")
+        text = st.text_input(
+            "Поисковая строка", value="Python", placeholder="например: Backend, Java, Data Engineer"
+        )
         area_id = area_picker("Локация")
         all_roles = get_roles_cache()
         role_names = [f"{r['name']} ({r['id']})" for r in all_roles]
         selected_roles = st.multiselect("Professional roles", role_names, default=[])
-        role_ids = [int(name.split("(")[-1].rstrip(")")) for name in selected_roles] if selected_roles else None
+        role_ids = (
+            [int(name.split("(")[-1].rstrip(")")) for name in selected_roles]
+            if selected_roles
+            else None
+        )
         schedules = get_schedules_cache()
         sched_map = {"": None}
         sched_map.update({f"{s['name']} ({s['id']})": s["id"] for s in schedules})
         sched_label = st.selectbox("Schedule", list(sched_map.keys()), index=0)
         schedule_id = sched_map[sched_label]
         per_page = st.slider("Per page (до 100)", min_value=10, max_value=100, value=50, step=10)
-        limit = st.number_input("Максимум вакансий", min_value=10, max_value=5000, value=500, step=50)
+        limit = st.number_input(
+            "Максимум вакансий", min_value=10, max_value=5000, value=500, step=50
+        )
         run = st.button("Искать ▶")
 
     with st.expander("Вход в hh.ru (OAuth)"):
@@ -238,12 +265,18 @@ def main():
         if not df.empty:
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-            fmt = st.selectbox("Формат выгрузки", ["CSV", "JSONL", "Parquet"], index=0, help="Parquet требует pyarrow")
+            fmt = st.selectbox(
+                "Формат выгрузки",
+                ["CSV", "JSONL", "Parquet"],
+                index=0,
+                help="Parquet требует pyarrow",
+            )
             data_bytes, mime, name = df_to_download(df, fmt)
             if data_bytes:
                 st.download_button("Скачать", data=data_bytes, file_name=name, mime=mime)
         else:
             st.info("Ничего не найдено. Измени фильтры и попробуй снова.")
+
 
 if __name__ == "__main__":
     main()

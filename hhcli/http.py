@@ -1,16 +1,19 @@
 from __future__ import annotations
-from typing import Any, Dict, Optional
-import time
+
 import logging
+import time
+from typing import Any
+
 import requests
 
-from .config import get_user_agent, get_access_token
+from .config import get_access_token, get_user_agent
 
 logger = logging.getLogger("hhcli.http")
 BASE_URL = "https://api.hh.ru"
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
-def _headers(auth: bool) -> Dict[str, str]:
+
+def _headers(auth: bool) -> dict[str, str]:
     h = {
         "User-Agent": get_user_agent(),
         "Accept": "application/json",
@@ -20,6 +23,7 @@ def _headers(auth: bool) -> Dict[str, str]:
         if token:
             h["Authorization"] = f"Bearer {token}"
     return h
+
 
 def _respect_limits(resp: requests.Response) -> None:
     # если на исходе лимит — подождём Reset
@@ -31,23 +35,25 @@ def _respect_limits(resp: requests.Response) -> None:
     except Exception:
         pass
 
+
 def request(
     method: str,
     path: str,
     *,
-    params: Optional[Dict[str, Any]] = None,
-    json: Optional[Dict[str, Any]] = None,
+    params: dict[str, Any] | None = None,
+    json: dict[str, Any] | None = None,
     auth: bool = False,
     retries: int = 3,
     timeout: int = 30,
 ) -> Any:
     url = f"{BASE_URL}{path}"
     backoff = 1.0
-    last_exc: Optional[Exception] = None
+    last_exc: Exception | None = None
     for attempt in range(retries):
         try:
             resp = requests.request(
-                method, url,
+                method,
+                url,
                 params=params,
                 json=json,
                 headers=_headers(auth),
