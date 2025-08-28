@@ -276,3 +276,5 @@ insert_final_newline = true
 ## Лицензия
 MIT (или иная по вашему выбору).
 
+![CI](https://github.com/StanBoron/hhcli/actions/workflows/ci.yml/badge.svg)
+

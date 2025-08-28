@@ -25,8 +25,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install -U pip
-          # ставим проект в editable режиме + extras для веба и разработки
+          # Ставим проект с extras для веба и разработки
           pip install -e ".[web,dev]"
+          # Страховка: если extras не подтянулись (разные версии pip/PEP 621 и т.д.)
+          pip install --upgrade --upgrade-strategy eager ruff black pytest
+
+      - name: Show versions
+        run: |
+          python --version
+          pip --version
+          ruff --version
+          black --version
+          pytest --version
 
       - name: Lint (ruff)
         run: ruff check hhcli
