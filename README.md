@@ -28,10 +28,16 @@ git clone https://github.com/StanBoron/hhcli.git
 cd hhcli
 ```
 
-Установить зависимости (рекомендуется через виртуальное окружение):
+Установить зависимости (через `pyproject.toml`):
 
 ```bash
-pip install -r requirements.txt
+pip install .
+```
+
+или (если используешь Poetry):
+
+```bash
+poetry install
 ```
 
 ---
