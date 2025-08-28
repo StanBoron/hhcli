@@ -1,280 +1,112 @@
-# hhcli — README, Troubleshooting & Dev Guide
+# hhcli
 
-> CLI и веб-интерфейс для работы с API hh.ru (поиск вакансий, справочники, OAuth вход, выгрузка CSV/JSONL/Parquet). Без БД.
+[![CI](https://github.com/StanBoron/hhcli/actions/workflows/ci.yml/badge.svg)](https://github.com/StanBoron/hhcli/actions/workflows/ci.yml)
 
----
-
-## Содержание
-- [Возможности](#возможности)
-- [Структура проекта](#структура-проекта)
-- [Быстрый старт](#быстрый-старт)
-- [Конфигурация и OAuth](#конфигурация-и-oauth)
-- [CLI — команды](#cli--команды)
-- [WebApp (Streamlit)](#webapp-streamlit)
-- [Переменные окружения](#переменные-окружения)
-- [Экспорт данных](#экспорт-данных)
-- [Логирование и отладка](#логирование-и-отладка)
-- [Частые проблемы (Troubleshooting)](#частые-проблемы-troubleshooting)
-- [Тестирование](#тестирование)
-- [Стиль кода и инструменты](#стиль-кода-и-инструменты)
-- [Roadmap](#roadmap)
+CLI и Web-приложение для работы с API [hh.ru](https://hh.ru).  
+Позволяет искать вакансии, выгружать их в CSV/JSONL/Parquet, управлять резюме и выполнять авторизацию через OAuth.
 
 ---
 
-## Возможности
-- CLI-команды для справочников (`areas`, `roles`, `dicts`), поиска (`search`, `export`), профиля (`me`), резюме (`my-resumes`) и проверки отклика (`can-respond`).
-- WebApp на Streamlit: фильтры (текст, локация, роли, график), таблица результатов, скачивание в CSV/JSONL/Parquet.
-- OAuth-вход (read+resumes+negotiations), автообмен `code→token`, проверка `/me` и просмотр `/resumes/mine`.
-- Ретраи и уважение лимитов API (`Retry-After`, `X-RateLimit-*`).
-- Поддержка ENV-переменных поверх `~/.hhcli/config.json`.
+## 🚀 Возможности
+
+- 🔍 **Поиск вакансий** с фильтрацией по региону, роли, опыту, зарплате и т.д.
+- 📄 **Информация о работодателях и вакансиях**
+- 📂 **Экспорт вакансий** в CSV, JSONL или Parquet
+- 👤 **Работа с резюме** (список своих резюме, проверка откликов)
+- 🌍 **Справочники hh.ru** (регионы, роли, словари)
+- 🖥️ **Веб-интерфейс** (на Streamlit) с поиском и выгрузкой вакансий
+- 🔑 **Поддержка OAuth 2.0** для доступа к приватным данным пользователя
 
 ---
 
-## Структура проекта
-```
-hhcli/
-  __init__.py
-  main.py              # точка входа для CLI
-  cli.py               # команды Typer
-  config.py            # конфиг и ENV overlay
-  http.py              # HTTP-клиент, ретраи, rate limit
-  auth.py              # OAuth URL, exchange, refresh
-  utils.py             # форматтеры, пагинация
-  web_app.py           # Streamlit UI
-  api/
-    __init__.py
-    vacancies.py
-    employers.py
-    areas.py
-    resumes.py
-    negotiations.py    # заготовка под отклики
-    professional_roles.py
-    dictionaries.py
-```
+## 📦 Установка и запуск
 
----
+Клонировать репозиторий:
 
-## Быстрый старт
 ```bash
-# зависимости CLI
-pip install requests typer[all]
+git clone https://github.com/StanBoron/hhcli.git
+cd hhcli
+```
 
-# WebApp
-pip install streamlit pandas  # + pyarrow (для Parquet)
+Установить зависимости (рекомендуется через виртуальное окружение):
 
-# Запуск CLI
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 🖥️ CLI-режим
+
+Запуск через модуль:
+
+```bash
 python -m hhcli.main --help
+```
 
-# Запуск WebApp
+Примеры команд:
+
+```bash
+# Сохранить client_id и client_secret
+python -m hhcli.main config --client-id XXX --client-secret YYY --redirect-uri "https://example.com/callback"
+
+# Ссылка для авторизации
+python -m hhcli.main oauth-url
+
+# Обмен кода на токен
+python -m hhcli.main oauth-exchange CODE
+
+# Поиск вакансий
+python -m hhcli.main search --text "Python developer" --area 113 --per-page 20
+```
+
+---
+
+## 🌐 Web-режим
+
+Запустить Streamlit-приложение:
+
+```bash
 streamlit run hhcli/web_app.py
 ```
 
----
-
-## Конфигурация и OAuth
-- Конфиг: `~/.hhcli/config.json` (создаётся автоматически).
-- ENV-переменные перекрывают файл (см. ниже).
-- Запрос скоупов: `read+resumes+negotiations`.
-- Redirect URI по умолчанию для локалки: `http://localhost:8501`.
-
-```bash
-# записать client_id/secret/redirect_uri
-python -m hhcli.main config --client-id "..." --client-secret "..." --redirect-uri "http://localhost:8501"
-
-# получить ссылку на вход
-python -m hhcli.main oauth-url
-
-# обменять code на токены
-python -m hhcli.main oauth-exchange CODE
-
-# обновить access_token
-python -m hhcli.main oauth-refresh
-
-# проверить токен
-python -m hhcli.main me
-```
-
-> В WebApp те же операции доступны в секции «Вход в hh.ru (OAuth)».
+После этого интерфейс будет доступен в браузере (по умолчанию на [http://localhost:8501](http://localhost:8501)).
 
 ---
 
-## CLI — команды
-```text
-config           Сохранить client_id/secret/redirect_uri/user_agent
-oauth-url        Вывести ссылку на авторизацию
-oauth-exchange   Обменять code на токены
-oauth-refresh    Обновить access_token
-areas [--parent] Дерево регионов/дети узла
-roles            Проф. роли (id/названия)
-dicts            Справочники (schedule и др.)
-employer <id>    Инфо о работодателе
-vacancy <id>     Инфо о вакансии
-search           Поиск вакансий (фильтры: text, area, role, schedule, ...)
-export           Экспорт вакансий (CSV/JSONL/Parquet)
-my-resumes       Список резюме (нужен токен)
-can-respond <id> Доступные резюме для отклика (нужен токен)
-me               Профиль /me (нужен токен)
-```
+## ⚙️ Структура проекта
 
-Примеры:
-```bash
-python -m hhcli.main areas --parent 113
-python -m hhcli.main roles
-python -m hhcli.main search --text "Python" --area 1 --role 96 --schedule remote --per-page 10
-python -m hhcli.main export --text "Java" --area 2 --fmt jsonl --limit 300 --out spb_java.jsonl
+```
+hhcli/
+├── api/               # Работа с API hh.ru (вакансии, резюме, справочники и пр.)
+├── tests/             # Тесты (pytest)
+├── cli.py             # CLI-интерфейс (Typer)
+├── web_app.py         # Streamlit Web-приложение
+├── config.py          # Работа с конфигом и токенами
+├── http.py            # HTTP-запросы с retry
+├── utils.py           # Вспомогательные функции (форматирование, пагинация)
+└── main.py            # Точка входа для CLI
 ```
 
 ---
 
-## WebApp (Streamlit)
-- Запуск: `streamlit run hhcli/web_app.py`
-- Сайдбар: фильтры (text, area, roles, schedule, per_page, limit)
-- Таблица результатов: кликабельные `url`, кнопка «Скачать» (CSV/JSONL/Parquet)
-- Встроенная секция OAuth: ввод `client_id/secret/redirect_uri`, генерация ссылки, автообмен `code`, `/me`, `Мои резюме`.
+## 🧪 Тестирование
 
----
-
-## Переменные окружения
-CLI и WebApp читают ENV поверх файла конфига:
-```
-HH_CLIENT_ID, HH_CLIENT_SECRET, HH_REDIRECT_URI, HH_USER_AGENT,
-HH_ACCESS_TOKEN, HH_REFRESH_TOKEN
-```
-
-**PowerShell:**
-```powershell
-$env:HH_CLIENT_ID="..."; $env:HH_CLIENT_SECRET="..."; python -m hhcli.main me
-```
-**CMD:**
-```bat
-set HH_CLIENT_ID=... & set HH_CLIENT_SECRET=... & python -m hhcli.main me
-```
-**bash/zsh:**
-```bash
-export HH_CLIENT_ID=... HH_CLIENT_SECRET=...; python -m hhcli.main me
-```
-
----
-
-## Экспорт данных
-- **CSV** — совместим с Excel; кодировка UTF‑8.
-- **JSONL** — построчный JSON (удобно для аналитики/бигдаты).
-- **Parquet** — колоночный формат (требует `pyarrow`).
-
-CLI:
-```bash
-python -m hhcli.main export --text "Python" --area 1 --fmt parquet --out vacancies.parquet
-```
-WebApp: выпадающий список формата под таблицей.
-
----
-
-## Логирование и отладка
-В `http.py` включён логгер `hhcli.http` с выводом тела ответа при ошибке. Включить INFO/DEBUG:
-```python
-# в начале программы/скрипта
-import logging
-logging.basicConfig(level=logging.INFO)
-# logging.getLogger("hhcli.http").setLevel(logging.DEBUG)
-```
-
-Для Streamlit:
-```bash
-streamlit run hhcli/web_app.py --logger.level=info
-```
-
-Ретраи/лимиты:
-- 429 — учитывается `Retry-After`.
-- `X-RateLimit-Remaining`/`Reset` — мягкая пауза при остатке <= 1.
-
----
-
-## Частые проблемы (Troubleshooting)
-**`ImportError: attempted relative import with no known parent package`**
-- Запускайте CLI так: `python -m hhcli.main ...` из корня проекта.
-- Для Streamlit используйте абсолютные импорты (`from hhcli.api import ...`).
-
-**`SyntaxError: from __future__ ... must occur at the beginning`**
-- Директива должна быть первой строкой файла.
-
-**`IndentationError`**
-- Проверьте отступы (4 пробела, без табов). В PyCharm — `Ctrl+Alt+L`.
-
-**`ModuleNotFoundError: No module named 'requests'`**
-- Установите зависимости в текущем venv: `pip install requests typer[all]`.
-
-**`400 Bad Request /token`**
-- Проверьте: `client_id/secret`, точное совпадение `redirect_uri`, `code` не протух/не использован.
-
-**`401 Unauthorized`**
-- Истёк token → выполните `oauth-refresh` или заново авторизуйтесь.
-
-**`403 Forbidden` на /resumes/mine**
-- Нужны скоупы `resumes` (+ `read`). Входите **аккаунтом соискателя**. Проверьте `/me`.
-
-**Лимиты**
-- Частые запросы → соблюдайте `Retry-After`, не ставьте `per_page=100` без необходимости, используйте `limit`.
-
----
-
-## Тестирование
-Минимум:
-- Юнит-тесты для `utils.format_salary` и `utils.paginate_vacancies` (моки).
-- Интеграционный тест `/vacancies` с VCR (pytest + `pytest-recording`).
-
-Шаблон `tests/test_utils.py`:
-```python
-from hhcli.utils import format_salary
-
-def test_format_salary_none():
-    assert format_salary(None) == ""
-
-def test_format_salary_full():
-    s = {"from": 100000, "to": 200000, "currency": "RUR", "gross": True}
-    assert "от 100000" in format_salary(s)
-    assert "до 200000" in format_salary(s)
-    assert "RUR" in format_salary(s)
-```
+Тесты написаны на `pytest`.
 
 Запуск:
+
 ```bash
-pip install pytest
 pytest -q
 ```
 
 ---
 
-## Стиль кода и инструменты
-Рекомендовано:
-- **Black** (форматирование): `pip install black` → `black hhcli`
-- **ruff** (линтер): `pip install ruff` → `ruff check hhcli`
-- **pre-commit**: настроить хуки на `black`/`ruff`.
+## 📌 TODO
 
-`.editorconfig` (минимум):
-```
-root = true
-[*]
-indent_style = space
-indent_size = 4
-charset = utf-8
-end_of_line = lf
-insert_final_newline = true
-```
+- [ ] Добавить поддержку откликов на вакансии
+- [ ] Реализовать "избранные" вакансии
+- [ ] Улучшить UI веб-интерфейса
+- [ ] Дополнить документацию API-примеров
 
 ---
-
-## Roadmap
-- Отклики/переписка: `POST /negotiations` + UI-кнопка «Откликнуться».
-- Сохранённые поиски/избранное (локальный JSON, без БД).
-- Больше фильтров: опыт/зарплата/тип занятости.
-- Dockerfile и публикация образа.
-- Кэш справочников в `~/.hhcli/cache` с TTL.
-- CI (GitHub Actions): lint + tests.
-
----
-
-## Лицензия
-MIT (или иная по вашему выбору).
-
-![CI](https://github.com/StanBoron/hhcli/actions/workflows/ci.yml/badge.svg)
-
