@@ -1,4 +1,8 @@
-from hhcli.utils import format_salary, paginate_vacancies
+from hhcli.utils import (
+    format_salary,
+    paginate_vacancies,
+)
+
 
 def test_format_salary_empty():
     assert format_salary(None) == ""
