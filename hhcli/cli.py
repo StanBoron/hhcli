@@ -21,7 +21,10 @@ from hhcli.api import (
 )
 from hhcli.auth import build_oauth_url, exchange_code, refresh_access_token, set_tokens
 from hhcli.config import load_config, save_config
+from hhcli.logs import setup_logging
 from hhcli.utils import build_text_query, format_salary, paginate_vacancies
+
+setup_logging()
 
 app = typer.Typer(add_completion=False, help="CLI-инструмент для работы с API hh.ru")
 

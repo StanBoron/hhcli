@@ -2,35 +2,37 @@ from __future__ import annotations
 
 import io
 import json
-import time
+import logging
 import re
+import time
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from hhcli.api import (
-    areas as areas_api,
-)
-from hhcli.api import (
-    dictionaries,
-    negotiations,
-    professional_roles,
-    resumes,
-    vacancies,
-)
-from hhcli.auth import build_oauth_url, exchange_code, set_tokens  # ← вот это важно
+from hhcli.api import areas as areas_api
+from hhcli.api import dictionaries, negotiations, professional_roles, resumes, vacancies
+from hhcli.auth import build_oauth_url, exchange_code, set_tokens
 from hhcli.config import load_config, save_config
+from hhcli.diag import runtime_snapshot
 from hhcli.http import request
-from hhcli.utils import format_salary, paginate_vacancies
+from hhcli.logs import setup_logging
+from hhcli.utils import build_text_query, format_salary, paginate_vacancies
 
+# ------------------------ ЛОГИ ------------------------
+log_file = setup_logging()  # читает HHCLI_LOG_LEVEL/HHCLI_LOG_FILE
+log = logging.getLogger("hhcli.webapp")
+log.info("WebApp start; log_file=%s", log_file)
+log.debug("Runtime snapshot: %s", runtime_snapshot())
+
+# ------------------------ UI -------------------------
 st.set_page_config(page_title="HH.ru Search", layout="wide")
 
 ID_RE = re.compile(r"^\d+$")
+DAILY_APPLY_LIMIT = 200  # лимит откликов за 24 часа на hh.ru
+
 
 # ========================= Caching of dictionaries =========================
-
-
 @st.cache_data(show_spinner=False)
 def get_roles_cache() -> list[dict[str, Any]]:
     data = professional_roles.get_roles()
@@ -38,6 +40,7 @@ def get_roles_cache() -> list[dict[str, Any]]:
     for group in data.get("categories", []):
         for r in group.get("roles", []):
             roles_flat.append({"id": int(r["id"]), "name": r["name"], "group": group["name"]})
+    log.debug("[CACHE] roles: %s items", len(roles_flat))
     return roles_flat
 
 
@@ -45,7 +48,9 @@ def get_roles_cache() -> list[dict[str, Any]]:
 def get_schedules_cache() -> list[dict[str, str]]:
     data = dictionaries.get_dictionaries()
     sched = data.get("schedule", []) or []
-    return [{"id": s["id"], "name": s["name"]} for s in sched]
+    out = [{"id": s["id"], "name": s["name"]} for s in sched]
+    log.debug("[CACHE] schedules: %s items", len(out))
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -57,8 +62,6 @@ def get_area_children(area_id: int | None) -> list[dict[str, Any]]:
 
 
 # ========================= Search helpers =========================
-
-
 def search_dataframe(
     *,
     text: str,
@@ -77,7 +80,7 @@ def search_dataframe(
     date_from: str | None,
     date_to: str | None,
     with_address: bool,
-    include_details: bool = False,  # ← правильное объявление
+    include_details: bool = False,
 ) -> pd.DataFrame:
     def fetch(page: int, per_page_: int):
         return vacancies.search_vacancies(
@@ -145,18 +148,16 @@ def search_dataframe(
                 row["key_skills"] = ", ".join(
                     sorted({(k or {}).get("name", "") for k in ks if (k or {}).get("name")})
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("[SEARCH] include_details err for id=%s: %s", row["id"], e)
         rows.append(row)
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    log.debug("[SEARCH] DF built rows=%s cols=%s", len(df), list(df.columns))
+    return df
 
 
 def df_to_download(df: pd.DataFrame, fmt: str) -> tuple[bytes | None, str, str]:
-    """
-    Возвращает (data_bytes, mime, filename) для выбранного формата.
-    fmt: 'CSV' | 'JSONL' | 'Parquet'
-    """
     fmt_u = fmt.upper()
     if fmt_u == "CSV":
         return df.to_csv(index=False).encode("utf-8"), "text/csv; charset=utf-8", "vacancies.csv"
@@ -178,12 +179,7 @@ def df_to_download(df: pd.DataFrame, fmt: str) -> tuple[bytes | None, str, str]:
 
 
 # ========================= UI helpers =========================
-
-
 def area_picker(label: str) -> int | None:
-    """
-    Простой «двухуровневый» выбор area: страна -> регионы/города.
-    """
     st.write(f"**{label}**")
     countries = get_area_children(None)
     c_map = {f"{c['name']} ({c['id']})": int(c["id"]) for c in countries}
@@ -204,8 +200,6 @@ def area_picker(label: str) -> int | None:
 
 
 # ========================= OAuth block =========================
-
-
 def oauth_ui():
     st.subheader("Вход в hh.ru (OAuth)")
 
@@ -231,7 +225,6 @@ def oauth_ui():
 
     st.caption("Скоупы: read + negotiations + resumes")
 
-    # --- Ссылка на авторизацию ---
     if st.button("Сгенерировать ссылку на авторизацию"):
         try:
             auth_url = build_oauth_url()
@@ -240,7 +233,7 @@ def oauth_ui():
         except Exception as e:
             st.error(f"Не удалось сформировать ссылку: {e}")
 
-    # --- Автозахват кода из query-параметров (новое/старое API Streamlit) ---
+    # Захват ?code=...
     code = None
     try:
         qp = st.query_params  # Streamlit >= 1.31
@@ -325,14 +318,11 @@ def oauth_ui():
         if uploaded is not None:
             try:
                 data = json.load(uploaded)
-
-                # Унифицируем: поддерживаем вложенный объект token и/или прямые ключи
                 token_obj = data.get("token") if isinstance(data, dict) else None
                 base = token_obj or data or {}
                 access_token = base.get("access_token")
                 refresh_token = base.get("refresh_token")
 
-                # expires_in: берём напрямую или считаем из access_expires_at
                 expires_in_val = None
                 if "expires_in" in base:
                     expires_in_val = int(base["expires_in"])
@@ -349,7 +339,8 @@ def oauth_ui():
                     )
             except Exception as e:
                 st.error(f"Не удалось прочитать JSON: {e}")
-    # --- Экспорт текущих токенов в JSON ---
+
+    # --- Экспорт токенов в JSON ---
     with st.expander("Экспорт токенов в JSON", expanded=False):
         st.caption(
             "Скачайте токены для переноса на другую машину. "
@@ -406,7 +397,7 @@ def oauth_ui():
             except Exception as e:
                 st.error(f"Ошибка запроса /me: {e}")
     with colB:
-        if st.button("Показать мои резюме"):
+        if st.button("Показать мои резюме", key="btn_oauth_show_resumes"):
             try:
                 data = resumes.my_resumes()
                 st.json(data)
@@ -415,8 +406,88 @@ def oauth_ui():
 
 
 # ========================= Respond (negotiations) =========================
+def _get_cleanup_state() -> dict:
+    cfg = load_config()
+    return cfg.setdefault("cleanup", {"hidden_negotiations": [], "employer_blacklist": []})
 
-DAILY_APPLY_LIMIT = 200
+
+def _hide_negotiation_locally(neg_id: str) -> None:
+    if not neg_id:
+        return
+    cfg = load_config()
+    stt = cfg.setdefault("cleanup", {"hidden_negotiations": [], "employer_blacklist": []})
+    lst: list[str] = stt.setdefault("hidden_negotiations", [])
+    if neg_id not in lst:
+        lst.append(neg_id)
+        save_config(cfg)
+
+
+def _blacklist_employer(emp_id: str) -> None:
+    if not emp_id:
+        return
+    cfg = load_config()
+    stt = cfg.setdefault("cleanup", {"hidden_negotiations": [], "employer_blacklist": []})
+    bl: list[str] = stt.setdefault("employer_blacklist", [])
+    if emp_id not in bl:
+        bl.append(emp_id)
+        save_config(cfg)
+
+
+def cleanup_rejections() -> tuple[int, list[str]]:
+    removed = 0
+    errs: list[str] = []
+
+    page = 0
+    while True:
+        data: dict[str, Any] = negotiations.list_negotiations(page=page, per_page=50) or {}
+        items = data.get("items", []) or []
+        if not items:
+            break
+
+        for it in items:
+            states: list[str] = []
+            for key in ("status", "state", "manager_state", "employer_state", "applicant_state"):
+                val = it.get(key)
+                if isinstance(val, dict):
+                    states.append((val.get("id") or "").lower())
+                elif isinstance(val, str):
+                    states.append(val.lower())
+            flat = " ".join(states)
+            is_rejected = any(
+                s in flat for s in ("discard", "declin", "reject", "refuse", "closed")
+            )
+            if is_rejected:
+                nid = it.get("id") or (
+                    it.get("url", "").rsplit("/", 1)[-1] if it.get("url") else ""
+                )
+                try:
+                    if nid:
+                        _hide_negotiation_locally(nid)
+                    emp = it.get("employer") or {}
+                    emp_id = str(emp.get("id") or "") if isinstance(emp, dict) else ""
+                    if emp_id:
+                        _blacklist_employer(emp_id)
+                    removed += 1
+                except Exception as err:
+                    errs.append(f"{nid or 'unknown'}: {err}")
+
+        pages = data.get("pages")
+        if isinstance(pages, int) and page + 1 >= pages:
+            break
+        if not items and pages is None:
+            break
+        page += 1
+
+    return removed, errs
+
+
+def _clean_ids(values: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for v in values:
+        s = str(v or "").strip()
+        if s and ID_RE.fullmatch(s):
+            cleaned.append(s)
+    return list(dict.fromkeys(cleaned))
 
 
 def _get_apply_counters() -> dict:
@@ -431,7 +502,7 @@ def _bump_apply_counters(delta: int) -> None:
     if counters["day_start"] == 0 or now - counters["day_start"] >= 24 * 3600:
         counters["day_start"] = now
         counters["sent"] = 0
-    counters["sent"] += delta
+    counters["sent"] += int(delta)
     save_config(cfg)
 
 
@@ -440,23 +511,13 @@ def _remaining_today() -> int:
     now = int(time.time())
     if counters["day_start"] == 0 or now - counters["day_start"] >= 24 * 3600:
         return DAILY_APPLY_LIMIT
-    return max(0, DAILY_APPLY_LIMIT - int(counters.get("sent", 0) or 0))
-
-def _clean_ids(values: list[str]) -> list[str]:
-    """Оставляем только цифры, отбрасываем пустые/NaN/мусор."""
-    cleaned: list[str] = []
-    for v in values:
-        s = str(v or "").strip()
-        if not s:
-            continue
-        m = ID_RE.fullmatch(s)
-        if m:
-            cleaned.append(m.group(0))
-    # Уникализируем с сохранением порядка
-    return list(dict.fromkeys(cleaned))
+    sent = int(counters.get("sent", 0) or 0)
+    return max(0, DAILY_APPLY_LIMIT - sent)
 
 
-def mass_apply(vacancy_ids: list[str], resume_id: str, message: str | None) -> tuple[int, int, list[str]]:
+def mass_apply(
+    vacancy_ids: list[str], resume_id: str, message: str | None
+) -> tuple[int, int, list[str]]:
     ok = 0
     skipped = 0
     errors: list[str] = []
@@ -473,126 +534,96 @@ def mass_apply(vacancy_ids: list[str], resume_id: str, message: str | None) -> t
     if remaining <= 0:
         return (0, len(vids), ["Достигнут лимит 200 откликов за 24 часа"])
 
-    for vid in vids[:remaining]:
+    to_send = vids[:remaining]
+    log.debug("[RESPOND_MASS] will_send=%s of %s", len(to_send), len(vids))
+
+    for vid in to_send:
         try:
+            payload_preview = {"vacancy_id": vid, "resume_id": resume_id}
+            if message:
+                payload_preview["message"] = {"text": message}
+            log.debug("[RESPOND_MASS] payload=%s", payload_preview)
+
             negotiations.create_response(vid, resume_id, message=message)
             ok += 1
-        except Exception as e:
+        except Exception as err:
             skipped += 1
-            errors.append(f"{vid}: {e}")
+            errors.append(f"{vid}: {err}")
+            log.exception("[RESPOND_MASS] error vid=%s err=%s", vid, err)
 
     if ok:
         _bump_apply_counters(ok)
-    return (ok, skipped + max(0, len(vids) - remaining), errors)
 
-def _get_cleanup_state() -> dict:
-    cfg = load_config()
-    return cfg.setdefault("cleanup", {"hidden_negotiations": [], "employer_blacklist": []})
+    skipped += max(0, len(vids) - len(to_send))
+    return (ok, skipped, errors)
 
 
-def _hide_negotiation_locally(neg_id: str) -> None:
-    cfg = load_config()
-    stt = cfg.setdefault("cleanup", {"hidden_negotiations": [], "employer_blacklist": []})
-    lst = stt.setdefault("hidden_negotiations", [])
-    if neg_id not in lst:
-        lst.append(neg_id)
-        save_config(cfg)
-
-
-def _blacklist_employer(emp_id: str) -> None:
-    cfg = load_config()
-    stt = cfg.setdefault("cleanup", {"hidden_negotiations": [], "employer_blacklist": []})
-    bl = stt.setdefault("employer_blacklist", [])
-    if emp_id and emp_id not in bl:
-        bl.append(emp_id)
-        save_config(cfg)
-
-
-def cleanup_rejections() -> tuple[int, list[str]]:
-    """
-    «Чистим» отказы локально: заносим переговоры в список скрытых,
-    а работодателей — опционально в blacklist.
-    Возвращает: (сколько помечено, ошибки[])
-    """
-    from hhcli.api import negotiations  # импорт локально, чтобы избежать циклов
-
-    removed = 0
-    errs: list[str] = []
-
-    page = 0
-    while True:
-        data: dict[str, Any] = negotiations.list_negotiations(page=page, per_page=50) or {}
-        items = data.get("items", []) or []
-        if not items:
-            break
-
-        for it in items:
-            # Вычислим «отказанное/закрытое» состояние
-            states: list[str] = []
-            for key in ("status", "state", "manager_state", "employer_state", "applicant_state"):
-                val = it.get(key)
-                if isinstance(val, dict):
-                    states.append((val.get("id") or "").lower())
-                elif isinstance(val, str):
-                    states.append(val.lower())
-            flat = " ".join(states)
-            is_rejected = any(
-                s in flat for s in ("discard", "declin", "reject", "refuse", "closed")
-            )
-
-            if is_rejected:
-                nid = it.get("id") or (
-                    it.get("url", "").rsplit("/", 1)[-1] if it.get("url") else ""
-                )
-                if nid:
-                    try:
-                        _hide_negotiation_locally(nid)
-                        # по желанию: заносим работодателя в чёрный список
-                        emp = it.get("employer") or {}
-                        emp_id = str(emp.get("id") or "") if isinstance(emp, dict) else ""
-                        if emp_id:
-                            _blacklist_employer(emp_id)
-                        removed += 1
-                    except Exception as e:
-                        errs.append(f"{nid}: {e}")
-
-        pages = data.get("pages")
-        if pages is not None and isinstance(pages, int) and page + 1 >= pages:
-            break
-        if not items and pages is None:
-            break
-        page += 1
-
-    return removed, errs
-
-
-def respond_ui():
+# ======== UI: одиночный и массовый отклики ========
+def respond_ui() -> None:
     st.subheader("Отклик на вакансию")
+    log.debug("[RESPOND_UI] open")
 
     st.caption(
-        "Для отклика нужен авторизованный доступ со scope: **read+resumes+negotiations**. "
-        "Возьми `vacancy_id` из таблицы поиска, `resume_id` — из «Показать мои резюме» "
-        "или из «Проверить доступные резюме»."
+        "Для отклика нужен авторизованный доступ со scope: **read + resumes + negotiations**. "
+        "ID вакансии берётся из поиска, ID резюме — из «Показать мои резюме» или «Проверить доступные резюме для вакансии»."
     )
 
-    # ========== ОДИНОЧНЫЙ ОТКЛИК ==========
-    st.markdown("#### Одиночный отклик")
+    # ---------- Одиночный отклик ----------
+    st.markdown("### Одиночный отклик")
 
     vacancy_id = st.text_input("ID вакансии", placeholder="например: 123456789")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Проверить доступные резюме для вакансии", key="btn_check_resumes_for_vac"):
+            v = (vacancy_id or "").strip()
+            if not v:
+                st.warning("Укажите ID вакансии.")
+            else:
+                try:
+                    data = negotiations.vacancy_resumes(v)
+                    items = data.get("items", []) or []
+                    if not items:
+                        st.info(
+                            "Подходящих резюме не найдено (или нет права отклика по этой вакансии)."
+                        )
+                    else:
+                        st.session_state["respond_resume_choices"] = [
+                            i.get("id", "") for i in items if i.get("id")
+                        ]
+                        st.success(
+                            f"Доступных резюме: {len(st.session_state['respond_resume_choices'])}"
+                        )
+                except Exception as err:
+                    st.error(f"Ошибка проверки резюме: {err}")
+
+    with col2:
+        if st.button("Показать мои резюме", key="btn_show_my_resumes_single"):
+            try:
+                mine = resumes.my_resumes() or {}
+                resume_items = (mine.get("items") or []) if isinstance(mine, dict) else []
+                st.session_state["respond_resume_choices"] = [
+                    i.get("id", "") for i in resume_items if i.get("id")
+                ]
+                st.success(
+                    f"Найдено моих резюме: {len(st.session_state['respond_resume_choices'])}"
+                )
+            except Exception as err:
+                st.error(f"Ошибка загрузки моих резюме: {err}")
 
     selected_resume_id = ""
     choices = st.session_state.get("respond_resume_choices") or []
     resume_title_map: dict[str, str] = {}
 
     if not choices:
-        # попробуем показать все мои резюме с названием
         try:
             mine = resumes.my_resumes() or {}
             resume_items = (mine.get("items") or []) if isinstance(mine, dict) else []
             for r in resume_items:
                 rid = r.get("id")
                 if rid:
-                    resume_title_map[f"{r.get('title', '(без названия)')} — {rid}"] = rid
+                    label = f"{r.get('title','(без названия)')} — {rid}"
+                    resume_title_map[label] = rid
         except Exception as err:
             st.error(f"Ошибка загрузки моих резюме: {err}")
 
@@ -605,7 +636,6 @@ def respond_ui():
         )
         selected_resume_id = resume_title_map.get(resume_label, "")
     else:
-        # fallback — просто id-список
         selected_resume_id = st.selectbox(
             "Выбери резюме для отклика",
             [""] + choices,
@@ -618,145 +648,83 @@ def respond_ui():
         placeholder="Коротко представьтесь и укажите релевантный опыт",
     )
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("Откликнуться ▶"):
-            v = (vacancy_id or "").strip()
-            r = (selected_resume_id or "").strip()
-            if not v:
-                st.warning("Укажите ID вакансии.")
-            elif not r:
-                st.warning("Выберите резюме для отклика.")
-            elif _remaining_today() <= 0:
-                st.warning("Достигнут лимит 200 откликов за 24 часа.")
-            else:
-                with st.spinner("Отправляю отклик…"):
-                    try:
-                        negotiations.create_response(
-                            vacancy_id=v,
-                            resume_id=r,
-                            message=(single_message or "").strip() or None,
-                        )
-                        _bump_apply_counters(1)
-                        st.success("Отклик отправлен.")
-                    except Exception as err:
-                        # красивый вывод для HTTP ошибок
-                        if isinstance(err, requests.HTTPError) and err.response is not None:
-                            st.error(f"HTTP {err.response.status_code}: {err.response.text}")
-                        else:
-                            st.error(f"Ошибка: {err}")
-
-    with col2:
-        if st.button("Обновить список моих резюме"):
-            try:
-                mine = resumes.my_resumes() or {}
-                resume_items = (mine.get("items") or []) if isinstance(mine, dict) else []
-                st.session_state["respond_resume_choices"] = [
-                    i.get("id", "") for i in resume_items if i.get("id")
-                ]
-                st.success(
-                    f"Найдено моих резюме: {len(st.session_state['respond_resume_choices'])}"
-                )
-            except Exception as e:
-                st.error(f"Ошибка загрузки моих резюме: {e}")
-
-    # красивый селект: показываем title и id
-    choices = st.session_state.get("respond_resume_choices") or []
-    resume_title_map = {}
-    if not choices:
-        # попробуем показать все мои резюме с названием
-        try:
-            mine = resumes.my_resumes() or {}
-            resume_items = (mine.get("items") or []) if isinstance(mine, dict) else []
-            for r in resume_items:
-                rid = r.get("id")
-                if rid:
-                    resume_title_map[f"{r.get('title','(без названия)')} — {rid}"] = rid
-        except Exception:
-            pass
-    if resume_title_map:
-        resume_label = st.selectbox(
-            "Выбери резюме для отклика",
-            [""] + list(resume_title_map.keys()),
-            index=0,
-            key="sel_resume_single",
-        )
-        resume_id = resume_title_map.get(resume_label, "")
-    else:
-        # fallback — просто id-список
-        resume_id = st.selectbox(
-            "Выбери резюме для отклика", [""] + choices, index=0, key="sel_resume_single_raw"
-        )
-
-    message = st.text_area(
-        "Сообщение работодателю (необязательно)",
-        placeholder="Коротко представьтесь и укажите релевантный опыт",
-    )
-
-    colx, coly = st.columns([1, 1])
+    colx, coly = st.columns(2)
     with colx:
-        st.metric("Лимит откликов / 24ч", 200)
+        st.metric("Лимит откликов / 24ч", DAILY_APPLY_LIMIT)
     with coly:
         st.metric("Доступно сейчас", _remaining_today())
 
-    if st.button("Откликнуться ▶"):
-        if not vacancy_id:
+    if st.button("Откликнуться ▶", key="btn_single_apply"):
+        v = (vacancy_id or "").strip()
+        r = (selected_resume_id or "").strip()
+        msg = (single_message or "").strip() or None
+
+        log.debug(
+            "[RESPOND_SINGLE] inputs vacancy_id=%r resume_id=%r msg_len=%s",
+            v,
+            r,
+            (len(msg) if msg else 0),
+        )
+
+        if not v:
             st.warning("Укажите ID вакансии.")
+            log.warning("[RESPOND_SINGLE] no vacancy_id")
             return
-        if not resume_id:
+        if not r:
             st.warning("Выберите резюме для отклика.")
+            log.warning("[RESPOND_SINGLE] no resume_id")
             return
         if _remaining_today() <= 0:
             st.warning("Достигнут лимит 200 откликов за 24 часа.")
+            log.warning("[RESPOND_SINGLE] apply limit reached")
             return
+
+        payload = {"vacancy_id": v, "resume_id": r, "message": {"text": msg} if msg else None}
+        log.debug("[RESPOND_SINGLE] payload=%s", payload)
+
         with st.spinner("Отправляю отклик…"):
             try:
-                resp = negotiations.create_response(
-                    vacancy_id=vacancy_id, resume_id=resume_id, message=message or None
-                )
-                # учтём лимит
+                resp = negotiations.create_response(vacancy_id=v, resume_id=r, message=msg)
+                log.debug("[RESPOND_SINGLE] response=%s", (resp if resp else "<no body>"))
                 _bump_apply_counters(1)
                 st.success("Отклик отправлен.")
-                if resp:
-                    st.json(resp)
             except Exception as err:
-                try:
-                    import requests  # noqa: WPS433
+                log.exception("[RESPOND_SINGLE] FAILED err=%s", err)
+                import requests as _rq  # noqa: WPS433
 
-                    if isinstance(err, requests.HTTPError) and err.response is not None:
-                        st.error(f"HTTP {err.response.status_code}: {err.response.text}")
-                    else:
-                        st.error(f"Ошибка: {err}")
-                except Exception:
+                if isinstance(err, _rq.HTTPError) and getattr(err, "response", None) is not None:
+                    st.error(f"HTTP {err.response.status_code}: {err.response.text}")
+                else:
                     st.error(f"Ошибка: {err}")
 
     st.divider()
 
-    # ========== МАССОВЫЙ ОТКЛИК ==========
-    st.markdown("#### Массовый отклик по найденным вакансиям")
+    # ---------- Массовый отклик ----------
+    st.markdown("### Массовый отклик")
 
     st.caption(
-        "Можно откликаться по результатам поиска (если вы используете вкладку «Поиск») "
-        "или вставить список ID вручную (по одному ID на строку)."
+        "Можно откликаться по результатам поиска (если в другой вкладке уже сделали поиск) "
+        "— ID возьмём из `st.session_state['last_search_ids']` — или вставить список ID вручную (по одному на строку)."
     )
 
-    # источник ID: из последнего поиска (если вы их сохраняете в session_state) + ручной ввод
-    last_ids: list[str] = st.session_state.get("last_search_ids", [])
+    last_ids: list[str] = st.session_state.get("last_search_ids", []) or []
     if last_ids:
         st.info(f"Из последнего поиска найдено {len(last_ids)} вакансий.")
+
     manual_ids_text = st.text_area(
-        "Список ID (по одному на строку)", value="", height=120, placeholder="123456\n987654\n..."
+        "Список ID (по одному на строку)",
+        value="",
+        height=120,
+        placeholder="123456\n987654\n...",
     )
-
     manual_ids = [x.strip() for x in manual_ids_text.splitlines() if x.strip()]
-    all_ids_raw = (st.session_state.get("last_search_ids") or []) + manual_ids
-    all_ids = _clean_ids(all_ids_raw)  # ← используем очистку
 
+    all_ids_raw = last_ids + manual_ids
+    all_ids = _clean_ids(all_ids_raw)
     st.caption(f"Кандидатов после фильтрации ID: {len(all_ids)}")
-    if not all_ids:
-        st.info("Нет валидных ID вакансий для отклика.")
+    log.debug("[RESPOND_MASS] merged_ids=%s cleaned=%s", len(all_ids_raw), len(all_ids))
 
-    # выбор резюме (повторим селект, чтобы не скроллить)
+    # резюме для массового отклика
     resume_id_mass = ""
     try:
         mine = resumes.my_resumes() or {}
@@ -768,13 +736,13 @@ def respond_ui():
         }
         if options:
             label = st.selectbox(
-                "Резюме для массового отклика", list(options.keys()), key="sel_resume_mass"
+                "Резюме для массового отклика", [""] + list(options.keys()), key="sel_resume_mass"
             )
             resume_id_mass = options.get(label, "")
         else:
             st.warning("У вас нет резюме — массовый отклик недоступен.")
-    except Exception as e:
-        st.error(f"Не удалось получить резюме: {e}")
+    except Exception as err:
+        st.error(f"Не удалось получить резюме: {err}")
 
     reply_msg = st.text_area(
         "Сообщение (опционально) для массового отклика",
@@ -798,43 +766,54 @@ def respond_ui():
 
     run_apply = st.button(
         "Откликнуться на список ▶",
+        key="btn_mass_apply",
         type="primary",
-        disabled=not (resume_id_mass and all_ids and _remaining_today() > 0),
+        disabled=not (resume_id_mass and all_ids and _remaining_today() > 0 and max_to_send > 0),
     )
 
     if run_apply:
-        if not resume_id_mass.strip():
+        r = (resume_id_mass or "").strip()
+        vids = all_ids[: int(max_to_send)]
+        log.debug(
+            "[RESPOND_MASS] resume_id=%r max_to_send=%s vids_first_10=%s count=%s",
+            r,
+            max_to_send,
+            vids[:10],
+            len(vids),
+        )
+
+        if not r:
             st.warning("Выберите резюме для отклика.")
-        elif not all_ids:
+            log.warning("[RESPOND_MASS] no resume_id")
+        elif not vids:
             st.warning("Список ID пуст.")
+            log.warning("[RESPOND_MASS] no vacancy_ids")
         else:
+            preview = [{"vacancy_id": v, "resume_id": r} for v in vids[:3]]
+            log.debug("[RESPOND_MASS] payload_preview=%s", preview)
+            with st.expander("DEBUG (первые 3 payloads)", expanded=False):
+                st.json(preview)
+
             with st.spinner("Отправляем отклики..."):
-                ok, skipped, errs = mass_apply(all_ids, resume_id_mass, reply_msg.strip() or None)
-                st.success(f"Готово. Успешно: {ok}, пропущено: {skipped}.")
-                if errs:
-                    st.warning("Некоторые вакансии пропущены/ошибки:")
-                    st.code("\n".join(errs)[:8000], language="text")
-
-    st.divider()
-
-    # ========== ЧИСТКА ОТКАЗОВ ==========
-    st.markdown("#### Чистка отказов и выход из переписок")
-    st.caption(
-        "Скрывает отклики с отказами локально (без удаления на стороне hh.ru). Работодатели из таких откликов добавляются в blacklist (по желанию), чтобы не попадались в выдаче и массовых откликах."
-    )
-    if st.button("Удалить переписки с отказами 🧹"):
-        with st.spinner("Чистим..."):
-            removed, errs = cleanup_rejections()
-            st.success(f"Помечено/скрыто: {removed}")
-            if errs:
-                st.warning("Некоторые элементы не удалось обработать:")
-                for e in errs[:10]:
-                    st.write(f"• {e}")
+                try:
+                    ok, skipped, errs = mass_apply(vids, r, (reply_msg or "").strip() or None)
+                    log.debug(
+                        "[RESPOND_MASS] result ok=%s skipped=%s err_count=%s errs_head=%s",
+                        ok,
+                        skipped,
+                        len(errs),
+                        errs[:3],
+                    )
+                    st.success(f"Готово. Успешно: {ok}, пропущено: {skipped}.")
+                    if errs:
+                        st.warning("Некоторые вакансии пропущены/ошибки:")
+                        st.code("\n".join(errs)[:8000], language="text")
+                except Exception as err:
+                    log.exception("[RESPOND_MASS] FAILED err=%s", err)
+                    st.error(f"Ошибка массового отклика: {err}")
 
 
 # ========================= Main =========================
-
-
 def main():
     st.title("HH.ru — Web Search (Streamlit)")
 
@@ -845,7 +824,6 @@ def main():
         )
         area_id = area_picker("Локация")
 
-        # Роли
         all_roles = get_roles_cache()
         role_names = [f"{r['name']} ({r['id']})" for r in all_roles]
         selected_roles = st.multiselect("Professional roles", role_names, default=[])
@@ -855,7 +833,6 @@ def main():
             else None
         )
 
-        # Опыт
         exp_map = {
             "": None,
             "Нет опыта (noExperience)": "noExperience",
@@ -866,34 +843,27 @@ def main():
         exp_label = st.selectbox("Опыт", list(exp_map.keys()), index=0)
         experience = exp_map[exp_label]
 
-        # Занятость (employment)
         emp_options = ["full", "part", "project", "volunteer", "probation"]
         emp_selected = st.multiselect("Занятость (employment)", emp_options, default=[])
 
-        # Расписание (schedule) — как было
         schedules = get_schedules_cache()
         sched_map: dict[str, str | None] = {"": None}
         sched_map.update({f"{s['name']} ({s['id']})": s["id"] for s in schedules})
         sched_label = st.selectbox("Schedule", list(sched_map.keys()), index=0)
         schedule_id = sched_map[sched_label]
 
-        # Зарплата + валюта
         salary = st.number_input("Зарплата от", min_value=0, step=5000, value=0)
         currency = st.selectbox("Валюта", ["", "RUR", "USD", "EUR"], index=0)
         only_with_salary = st.checkbox("Только с зарплатой", value=False)
 
-        # Поля поиска/сортировка
         search_field = st.selectbox(
             "Искать в поле", ["", "name", "company_name", "description"], index=0
         )
         order_by = st.selectbox("Сортировка", ["", "publication_time", "relevance"], index=0)
 
-        # Даты
         col_d1, col_d2 = st.columns(2)
         with col_d1:
-            date_from = st.date_input(
-                "Дата с", value=None, format="YYYY-MM-DD"
-            )  # returns date|None
+            date_from = st.date_input("Дата с", value=None, format="YYYY-MM-DD")
         with col_d2:
             date_to = st.date_input("Дата по", value=None, format="YYYY-MM-DD")
 
@@ -905,15 +875,15 @@ def main():
         )
         include_details = st.checkbox("Включить подробности (медленнее)", value=False)
         run = st.button("Искать ▶")
+
+        # --- Ключевые слова по полям ---
         st.markdown("### Ключевые слова по полям")
 
-        # Группа INCLUDE
         with st.expander("Искать эти слова (INCLUDE)", expanded=False):
             name_inc = st.text_input("NAME (через запятую)", value="")
             company_inc = st.text_input("COMPANY_NAME (через запятую)", value="")
             desc_inc = st.text_input("DESCRIPTION (через запятую)", value="")
 
-        # Группа EXCLUDE
         with st.expander("Исключить эти слова (EXCLUDE)", expanded=False):
             name_exc = st.text_input("NAME — исключить (через запятую)", value="")
             company_exc = st.text_input("COMPANY_NAME — исключить (через запятую)", value="")
@@ -941,8 +911,6 @@ def main():
 
     if run:
         with st.spinner("Выполняю поиск…"):
-            from hhcli.utils import build_text_query
-
             text_built = build_text_query(
                 name_kw=name_kw_list,
                 name_not=name_not_list,
@@ -953,6 +921,13 @@ def main():
                 mode=kw_mode,
             )
             effective_text = text_built or text
+
+            log.debug(
+                "[SEARCH] built_text=%r base_text=%r effective_text=%r",
+                text_built,
+                text,
+                effective_text,
+            )
 
             if text_built:
                 st.caption("Собранный текст запроса:")
@@ -977,10 +952,12 @@ def main():
                 with_address=with_address,
                 include_details=include_details,
             )
-            if text_built:
-                st.caption("Собранный запрос:")
-                st.code(text_built, language="text")
+
         st.success(f"Найдено строк: {len(df)}")
+        log.debug("[SEARCH] found_rows=%s cols=%s", len(df), list(df.columns))
+        if not df.empty and "id" in df.columns:
+            ids = [str(x) for x in df["id"].tolist()][:20]
+            log.debug("[SEARCH] first_ids=%s", ids)
 
         _cleanup = _get_cleanup_state()
         bl = set(str(x) for x in (_cleanup.get("employer_blacklist") or []))
@@ -988,17 +965,14 @@ def main():
             df = df[~df["employer_id"].astype(str).isin(bl)].reset_index(drop=True)
 
         if not df.empty:
-            st.dataframe(df, uwidth="stretch", hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
 
-            if not df.empty and "id" in df.columns:
-                st.session_state["last_search_ids"] = _clean_ids([str(x) for x in df["id"].tolist()])
+            if "id" in df.columns:
+                st.session_state["last_search_ids"] = _clean_ids(
+                    [str(x) for x in df["id"].tolist()]
+                )
 
-            fmt = st.selectbox(
-                "Формат выгрузки",
-                ["CSV", "JSONL", "Parquet"],
-                index=0,
-                help="Parquet требует pyarrow",
-            )
+            fmt = st.selectbox("Формат выгрузки", ["CSV", "JSONL", "Parquet"], index=0)
             data_bytes, mime, name = df_to_download(df, fmt)
             if data_bytes:
                 st.download_button("Скачать", data=data_bytes, file_name=name, mime=mime)
@@ -1009,7 +983,6 @@ def main():
         else:
             st.info("Ничего не найдено. Измени фильтры и попробуй снова.")
 
-    # Секция отклика (всегда доступна, т.к. может потребоваться отдельно от поиска)
     with st.expander("Отклик на вакансию", expanded=False):
         respond_ui()
 
