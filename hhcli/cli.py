@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -40,6 +41,40 @@ from hhcli.utils import build_text_query, format_salary, paginate_vacancies
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+IGNORED_FILE = Path.home() / ".hhcli" / "ignored_negotiations.json"
+
+NEG_UNIGNORE_IDS_ARG = typer.Argument(
+    None,
+    help="ID переговоров для удаления из ignore-листа.",
+)
+
+
+def _ignored_load() -> set[str]:
+    try:
+        data = json.loads(IGNORED_FILE.read_text(encoding="utf-8"))
+        return set(str(x) for x in data if x)
+    except Exception:
+        return set()
+
+
+def _ignored_save(ids: set[str]) -> None:
+    IGNORED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    IGNORED_FILE.write_text(json.dumps(sorted(ids), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ignore_negotiation_local(neg_id: str) -> tuple[bool, str]:
+    """Локально «спрятать» переговор: добавить в ~/.hhcli/ignored_negotiations.json."""
+    try:
+        ids = _ignored_load()
+        if neg_id in ids:
+            return True, "ignored_local (already)"
+        ids.add(str(neg_id))
+        _ignored_save(ids)
+        return True, "ignored_local"
+    except Exception as e:
+        return False, f"local_ignore_error: {e}"
+
 
 # -------------------- Константы/фразы отказов --------------------
 
@@ -819,9 +854,38 @@ def _iter_negotiations(per_page: int = 100):
         )
         items = (data or {}).get("items") or []
         logger.debug("iter_negotiations: page=%d items=%d", page, len(items))
-        yield from items
+        # --- новое: фильтр по ignore-листу ---
+        ignored = _ignored_load()
+        for _neg in items:
+            _nid = str(_neg.get("id") or _neg.get("negotiation_id") or "")
+            if _nid and _nid in ignored:
+                logger.debug("iter_negotiations: skip locally ignored neg#%s", _nid)
+                continue
+            yield _neg
+        # ---
         if not items or (data.get("page", page) >= data.get("pages", page)):
             logger.debug("iter_negotiations: stop")
+            break
+        page += 1
+
+
+def _iter_active_negotiations(per_page: int = 100):
+    """Итерирует активные отклики (status=active) постранично."""
+    logger.debug("iter_active_negotiations: start per_page=%d", per_page)
+    page = 0
+    while True:
+        logger.debug("iter_active_negotiations: GET /negotiations page=%d", page)
+        data = request(
+            "GET",
+            "/negotiations",
+            params={"page": page, "per_page": per_page, "status": "active"},
+            auth=True,
+        )
+        items = (data or {}).get("items") or []
+        logger.debug("iter_active_negotiations: page=%d items=%d", page, len(items))
+        yield from items  # компактнее, чем for ...: yield ...
+        if not items or (data.get("page", page) >= data.get("pages", page)):
+            logger.debug("iter_active_negotiations: stop")
             break
         page += 1
 
@@ -835,6 +899,18 @@ def _text_has_refusal(text: str) -> bool:
     if not t:
         return False
     return any(p in t for p in _REFUSAL_PHRASES)
+
+
+def _parse_iso_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        s2 = s.replace("Z", "+00:00")
+        if len(s2) > 5 and (s2[-5] in ["+", "-"]) and s2[-3] != ":":
+            s2 = s2[:-2] + ":" + s2[-2:]
+        return datetime.fromisoformat(s2)
+    except Exception:
+        return None
 
 
 def _fetch_last_message_text(neg: dict) -> str:
@@ -901,16 +977,10 @@ def _is_refused(neg: dict) -> bool:
 
 
 def _close_or_archive_negotiation(neg_id: str) -> tuple[bool, str]:
-    """Закрыть или (если не получилось) заархивировать переговоры."""
-    try:
-        request("POST", f"/negotiations/{neg_id}/close", auth=True)
-        return True, "closed"
-    except Exception as err1:
-        try:
-            request("POST", f"/negotiations/{neg_id}/archive", auth=True)
-            return True, "archived"
-        except Exception as err2:
-            return False, f"{err1} | {err2}"
+    """[DEPRECATED ACTION] Для соискателя закрытие/архивация недоступны через API hh.ru.
+    Вместо этого отмечаем переговор локально как «игнорируемый».
+    """
+    return _ignore_negotiation_local(neg_id)
 
 
 def _leave_negotiation(neg_id: str) -> tuple[bool, str]:
@@ -933,13 +1003,26 @@ def _leave_negotiation(neg_id: str) -> tuple[bool, str]:
 @app.command("negotiations-clean-refused")
 def negotiations_clean_refused(
     limit: int = typer.Option(
-        0, "--limit", help="Ограничить количество закрытых переписок (0 — без ограничения)."
+        0, "--limit", help="Ограничить количество закрытых/скрытых переписок (0 — без ограничения)."
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Только показать, без действий."),
+    purge_local: bool = typer.Option(
+        False, "--purge-local", help="Очистить локальный список скрытых переговоров и выйти."
+    ),
 ) -> None:
     total = 0
     done = 0
     errors = 0
+
+    if purge_local:
+        try:
+            if IGNORED_FILE.exists():
+                IGNORED_FILE.unlink()
+            typer.secho("Local ignore list cleared.", fg=typer.colors.GREEN)
+        except Exception as e:
+            typer.secho(f"Failed to clear ignore list: {e}", fg=typer.colors.RED)
+        return
+
     for neg in _iter_negotiations():
         neg_id = str(neg.get("id") or neg.get("negotiation_id") or "")
         if not neg_id or not _is_refused(neg):
@@ -947,7 +1030,7 @@ def negotiations_clean_refused(
         total += 1
         prefix = f"[{total}] neg#{neg_id} "
         if dry_run:
-            typer.secho(prefix + "would close (dry-run)", fg=typer.colors.BLUE)
+            typer.secho(prefix + "would ignore locally (dry-run)", fg=typer.colors.BLUE)
         else:
             ok, msg = _close_or_archive_negotiation(neg_id)
             if ok:
@@ -958,10 +1041,101 @@ def negotiations_clean_refused(
                 typer.secho(prefix + f"error: {msg}", fg=typer.colors.RED)
         if limit and done >= limit:
             break
+
     typer.secho(
-        f"Processed: {total}; closed: {done}; errors: {errors}",
+        f"Processed: {total}; ignored_local: {done}; errors: {errors}",
         fg=typer.colors.GREEN if errors == 0 else typer.colors.YELLOW,
     )
+
+
+@app.command("responses-delete")
+def responses_delete(
+    days: int = typer.Option(
+        21, "--days", help="Порог давности для state=response (дни). По умолчанию 21."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Только показать, без удаления."),
+    limit: int = typer.Option(
+        0, "--limit", help="Ограничить число удалений (0 — без ограничения)."
+    ),
+) -> None:
+    """
+    Удаляет активные отклики:
+      • state=discard — всегда,
+      • state=response — если updated_at старше N дней.
+    Переписки/чаты не трогаем.
+    Требуются импорты: from datetime import datetime, timedelta, timezone
+    И хелпер: _parse_iso_dt(s) -> datetime | None
+    """
+    now_utc = datetime.now(UTC)
+    cutoff = now_utc - timedelta(days=days)
+
+    checked = deleted = errors = 0
+    reason_discard = 0
+    reason_old = 0
+
+    for item in _iter_active_negotiations():
+        if item.get("hidden"):
+            continue
+        neg_id = str(item.get("id") or item.get("negotiation_id") or "")
+        if not neg_id:
+            continue
+
+        state_id = ((item.get("state") or {}).get("id") or "").lower()
+        is_discard = state_id == "discard"
+        is_response = state_id == "response"
+
+        is_old_response = False
+        if is_response:
+            dt = _parse_iso_dt(item.get("updated_at"))
+            if dt and dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            is_old_response = bool(dt and dt < cutoff)
+
+        if not (is_discard or is_old_response):
+            continue
+
+        checked += 1
+        reason = "discard" if is_discard else f"response_older_{days}d"
+        if dry_run:
+            typer.secho(
+                f"[{checked}] neg#{neg_id} ({reason}) would DELETE (dry-run)", fg=typer.colors.BLUE
+            )
+        else:
+            try:
+                resp = request(
+                    "DELETE",
+                    f"/negotiations/active/{neg_id}",
+                    params={"with_decline_message": bool(item.get("decline_allowed") or False)},
+                    auth=True,
+                )
+                # 204 No Content -> resp is None (успех), допускаем и {}
+                if (resp is None) or (isinstance(resp, dict) and not resp):
+                    deleted += 1
+                    if is_discard:
+                        reason_discard += 1
+                    else:
+                        reason_old += 1
+                    typer.secho(
+                        f"[{checked}] neg#{neg_id} ({reason}) deleted", fg=typer.colors.GREEN
+                    )
+                else:
+                    typer.secho(
+                        f"[{checked}] neg#{neg_id} ({reason}) unexpected response: {resp!r}",
+                        fg=typer.colors.YELLOW,
+                    )
+            except Exception as e:
+                errors += 1
+                typer.secho(f"[{checked}] neg#{neg_id} ({reason}) error: {e}", fg=typer.colors.RED)
+
+        if limit and deleted >= limit:
+            break
+
+    # Итоговая сводка
+    summary = (
+        f"Checked: {checked}; deleted: {deleted} "
+        f"(discard: {reason_discard}, old>{days}d: {reason_old}); errors: {errors}"
+    )
+    typer.secho(summary, fg=typer.colors.GREEN if errors == 0 else typer.colors.YELLOW)
 
 
 # 2) Выход из чатов с отказами
@@ -1028,6 +1202,78 @@ def resume_autoraise(
     while True:
         time.sleep(seconds)
         _raise_once()
+
+
+@app.command("negotiations-show-ignored")
+def negotiations_show_ignored(
+    as_json: bool = typer.Option(False, "--json", help="Вывести список в формате JSON."),
+    limit: int = typer.Option(
+        0, "--limit", help="Ограничить количество выводимых ID (0 — без ограничений)."
+    ),
+    show_path: bool = typer.Option(
+        False, "--show-path", help="Показать путь к файлу ignore-листа и выйти."
+    ),
+) -> None:
+    """
+    Показать текущий локальный список игнорируемых переговоров (~/.hhcli/ignored_negotiations.json).
+    """
+    if show_path:
+        typer.secho(str(IGNORED_FILE), fg=typer.colors.BLUE)
+        return
+
+    ids = sorted(_ignored_load())
+    if limit and len(ids) > limit:
+        ids = ids[:limit]
+
+    if as_json:
+        typer.echo(json.dumps(ids, ensure_ascii=False, indent=2))
+    else:
+        if not ids:
+            typer.secho("Ignored list is empty.", fg=typer.colors.YELLOW)
+            return
+        typer.secho(f"Ignored negotiations ({len(ids)}):", fg=typer.colors.GREEN)
+        for i, nid in enumerate(ids, 1):
+            typer.echo(f"{i:4d}. {nid}")
+
+
+@app.command("negotiations-unignore")
+def negotiations_unignore(
+    ids: list[str] | None = NEG_UNIGNORE_IDS_ARG,
+    all_: bool = typer.Option(
+        False, "--all", help="Удалить все записи из ignore-листа (эквивалент purge)."
+    ),
+) -> None:
+    """
+    Удалить один/несколько переговоров из локального ignore-листа.
+    """
+    if all_:
+        try:
+            if IGNORED_FILE.exists():
+                IGNORED_FILE.unlink()
+            typer.secho("Local ignore list cleared (all).", fg=typer.colors.GREEN)
+        except Exception as e:
+            typer.secho(f"Failed to clear ignore list: {e}", fg=typer.colors.RED)
+        return
+
+    if not ids:
+        typer.secho("Nothing to do: pass one or more IDs or use --all.", fg=typer.colors.YELLOW)
+        return
+
+    current = _ignored_load()
+    removed = []
+    for nid in ids:
+        if nid in current:
+            current.remove(nid)
+            removed.append(nid)
+
+    if removed:
+        try:
+            _ignored_save(current)
+            typer.secho(f"Removed from ignore: {', '.join(removed)}", fg=typer.colors.GREEN)
+        except Exception as e:
+            typer.secho(f"Failed to save ignore list: {e}", fg=typer.colors.RED)
+    else:
+        typer.secho("No matching IDs found in ignore list.", fg=typer.colors.YELLOW)
 
 
 # -------------------- Entry --------------------
