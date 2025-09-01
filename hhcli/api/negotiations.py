@@ -1,89 +1,89 @@
+# hhcli/api/negotiations.py
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from typing import Any
 
 from hhcli.http import request
 
-log = logging.getLogger("hhcli.api.negotiations")
+LOG = logging.getLogger("hhcli.api.negotiations")
 
 
 def create_response(
-    vacancy_id: str, resume_id: str, message: str | None = None
+    vacancy_id: str,
+    resume_id: str,
+    *,
+    message: str | None = None,
 ) -> dict[str, Any] | None:
-    v = (vacancy_id or "").strip()
-    r = (resume_id or "").strip()
-    log.debug(
+    """
+    POST /negotiations
+
+    Важно:
+    - hh иногда требует письмо (message). Если сервер отвечает "Letter required",
+      вызовите повторно с непустым message.
+    - Наш request() уже умеет fallback JSON→form на 400 bad_argument (по логам).
+    """
+    LOG.debug(
         "[NEGOTIATIONS] create_response inputs vacancy_id=%r resume_id=%r msg_len=%s",
-        v,
-        r,
-        (len(message) if message else 0),
+        vacancy_id,
+        resume_id,
+        0 if not message else len(message),
     )
-    if not v or not r:
-        log.error("[NEGOTIATIONS] empty ids v=%r r=%r", v, r)
-        raise ValueError(f"vacancy_id/resume_id пусты: vacancy_id='{v}', resume_id='{r}'")
 
-    payload: dict[str, Any] = {"vacancy_id": v, "resume_id": r}
+    payload: dict[str, Any] = {"vacancy_id": vacancy_id, "resume_id": resume_id}
     if message:
-        payload["message"] = {"text": message}
-    log.debug("[NEGOTIATIONS] payload=%s", payload)
+        payload["message"] = message.strip()
 
-    # 1) Пробуем JSON
-    try:
-        resp = request("POST", "/negotiations", json=payload, auth=True)
-        log.debug("[NEGOTIATIONS] JSON ok -> %s", (resp if resp else "<no body>"))
-        return resp
-    except Exception as err:  # noqa: BLE001
-        import requests  # локально
-
-        bad_json = False
-        if isinstance(err, requests.HTTPError) and err.response is not None:
-            body = err.response.text or ""
-            status = err.response.status_code
-            log.error("[NEGOTIATIONS] JSON HTTP %s body=%s", status, body[:400].replace("\n", " "))
-            # если сервер одновременно ругается на оба аргумента — часто это признак того,
-            # что он не принял JSON как тело (редкий кейс у некоторых окружений)
-            bad_json = status == 400 and '"vacancy_id"' in body and '"resume_id"' in body
-        else:
-            log.exception("[NEGOTIATIONS] JSON error: %s", err)
-
-        if not bad_json:
-            # если ошибка «иная», пробрасываем как есть
-            raise
-
-    # 2) На редкий случай — ретрай FORM (application/x-www-form-urlencoded)
-    form_payload = {"vacancy_id": v, "resume_id": r}
-    if message:
-        # сервер в form не принимает nested msg; пошлём без него
-        log.debug("[NEGOTIATIONS] FORM fallback (без message)")
-    log.debug("[NEGOTIATIONS] FORM payload=%s", form_payload)
-    resp2 = request("POST", "/negotiations", data=form_payload, auth=True)
-    log.debug("[NEGOTIATIONS] FORM ok -> %s", (resp2 if resp2 else "<no body>"))
-    return resp2
-
-
-def list_negotiations(page: int = 0, per_page: int = 50) -> dict[str, Any]:
-    return request("GET", "/negotiations", params={"page": page, "per_page": per_page}, auth=True)
-
-
-def get_negotiation(negotiation_id: str) -> dict[str, Any]:
-    return request("GET", f"/negotiations/{negotiation_id}", auth=True)
-
-
-def vacancy_resumes(vacancy_id: str) -> dict[str, Any]:
-    """GET /vacancies/{id}/resumes — какие резюме можно использовать для отклика на вакансию."""
-    vid = (vacancy_id or "").strip()
-    if not vid:
-        raise ValueError("vacancy_id пуст")
-    return request("GET", f"/vacancies/{vid}/resumes", auth=True)
+    LOG.debug("[NEGOTIATIONS] payload=%s", payload)
+    resp = request("POST", "/negotiations", json=payload, auth=True)
+    # /negotiations часто отвечает 201 без тела
+    if not resp:
+        LOG.debug("[NEGOTIATIONS] JSON ok -> <no body>")
+        return None
+    return resp
 
 
 def delete_negotiation(negotiation_id: str) -> None:
     """
-    Для соискателя на HH реального DELETE нет — сервер отвечает 405 (method_not_allowed).
-    Оставляем no-op-заглушку.
+    DELETE /negotiations/{id}
+    Может вернуть 403/405/409 — безопасно игнорируем.
     """
-    log.debug(
-        "[NEGOTIATIONS] delete_negotiation called id=%s (no-op for applicant)", negotiation_id
-    )
-    return None
+    with suppress(Exception):
+        request("DELETE", f"/negotiations/{negotiation_id}", auth=True)
+
+
+def list_negotiations(status: str | None = None, per_page: int = 50) -> list[dict[str, Any]]:
+    """
+    GET /negotiations (или /negotiations?status=messages | invited | discarded | ...)
+
+    Возвращает список объектов переговоров (упрощённо items[] из API).
+    """
+    params: dict[str, Any] = {"per_page": per_page}
+    if status:
+        params["status"] = status
+    data = request("GET", "/negotiations", params=params, auth=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return []
+    return [x for x in items if isinstance(x, dict)]
+
+
+def cleanup_rejections() -> tuple[int, list[str]]:
+    """
+    Удаляет/закрывает ветки переговоров со статусом 'discarded' (отказы).
+    Возвращает (сколько_удалили, ошибки[]).
+    """
+    removed = 0
+    errors: list[str] = []
+    for it in list_negotiations(status="discarded", per_page=100):
+        nid = str(it.get("id") or it.get("negotiation_id") or "")
+        if not nid:
+            continue
+        try:
+            delete_negotiation(nid)
+            removed += 1
+        except Exception as err:  # на всякий
+            LOG.warning("Failed to delete negotiation %s: %s", nid, err)
+            errors.append(f"{nid}: {err}")
+    return removed, errors

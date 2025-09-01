@@ -26,8 +26,11 @@ def _scrub_headers(h: dict[str, Any] | None) -> dict[str, Any]:
 
 def _preview(obj: Any, limit: int = 1000) -> str:
     try:
-        # было: isinstance(obj, (dict, list))
-        txt = json.dumps(obj, ensure_ascii=False) if isinstance(obj, dict | list) else str(obj)
+        txt = (
+            json.dumps(obj, ensure_ascii=False)
+            if isinstance(obj, dict | list)  # ✅ заменили на X | Y
+            else str(obj)
+        )
     except Exception:
         txt = str(obj)
     return txt[:limit]
@@ -41,17 +44,14 @@ def setup_logging(
       - ротация по 1 МБ, хранит 5 файлов
       - маскирует Authorization
       - формат: ts level logger msg
-    Уровень берется из HHCLI_LOG_LEVEL (по умолчанию INFO).
+    Уровень — HHCLI_LOG_LEVEL (по умолчанию INFO).
     Путь — HHCLI_LOG_FILE (по умолчанию ~/.hhcli/hhcli.log).
-    Возвращает путь к лог-файлу.
     """
     log_level = (level or DEFAULT_LEVEL).upper()
     log_file = Path(file_path or os.environ.get("HHCLI_LOG_FILE", DEFAULT_LOG_FILE))
-
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     root = logging.getLogger()
-    # не дублируем хендлеры при повторных вызовах
     if getattr(root, "_hhcli_configured", False):
         return log_file
 
@@ -110,7 +110,7 @@ def http_log_response(
     request_id: str | None,
 ) -> None:
     log = logging.getLogger("hhcli.http")
-    rid = f" request_id={request_id}" if request_id else ""
+    rid = f", request_id={request_id}" if request_id else ""
     log.debug(
         "HTTP Response %s %s -> %s (%sms)%s body=%s",
         method,
@@ -124,7 +124,6 @@ def http_log_response(
 
 def parse_request_id(resp) -> str | None:
     try:
-        # hh.ru присылает request_id в теле и/или заголовках
         rid = resp.headers.get("X-Request-Id") or resp.headers.get("Request-Id")
         if rid:
             return str(rid)
