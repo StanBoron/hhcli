@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .cli import app
+from hhcli.cli import app
 
 
 def run():
