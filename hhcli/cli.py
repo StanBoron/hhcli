@@ -24,8 +24,8 @@ from hhcli.auth import build_oauth_url, exchange_code, refresh_access_token, set
 from hhcli.config import load_config, save_config
 from hhcli.http import request
 from hhcli.logs import setup_logging
-from hhcli.respond.constants import CSV_HEADERS
-from hhcli.respond.mass_utils import (
+from hhcli.respond import (
+    CSV_HEADERS,
     get_vacancy_meta,
     read_ids_from_file,
     resume_allowed_for_vacancy,
@@ -36,13 +36,95 @@ from hhcli.respond.mass_utils import (
 from hhcli.respond.types import RespondResult as _RespondMassResult
 from hhcli.utils import build_text_query, format_salary, paginate_vacancies
 
-_REFUSED_STATES = {"rejected", "refused", "declined", "finished", "employer_refused", "discarded"}
+# -------------------- Логирование --------------------
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
-app = typer.Typer(add_completion=False, help="CLI-инструмент для работы с API hh.ru")
+# -------------------- Константы/фразы отказов --------------------
 
+# Встречающиеся стейты отказов на стороне HH
+_REFUSED_STATES = {
+    "rejected",
+    "refused",
+    "declined",
+    "finished",
+    "employer_refused",
+    "discard",  # фактический id в ленте переговоров
+    "discarded",  # встречается в других эндпоинтах/старых ответах
+}
+
+# Дефолтные фразы, если JSON не найден/некорректен
+_DEFAULT_REFUSAL_PHRASES: list[str] = [
+    # короткие ключевые
+    "отказ",
+    "отклонен",
+    "отклонена",
+    "отклонено",
+    # частые формулировки
+    "не готовы пригласить вас на следующий этап",
+    "мы выбрали другого кандидата",
+    "к сожалению, мы вынуждены отказать",
+    "решили отказать",
+    "ваша кандидатура нам не подходит",
+    "вашу кандидатуру отклонили",
+    "отказались от продолжения",
+    "не готовы продолжать",
+]
+
+
+def _load_refusal_phrases() -> list[str]:
+    """
+    Загружает список фраз отказа из hhcli/respond/refusal_phrases.json.
+    Формат файла:
+      либо массив строк: ["...", "..."]
+      либо объект {"phrases": ["...", "..."]}
+
+    Возвращает список в lowercase (casefold), без пустых и дублей.
+    """
+    candidates = [
+        Path(__file__).parent / "respond" / "refusal_phrases.json",
+        Path.cwd() / "hhcli" / "respond" / "refusal_phrases.json",
+    ]
+    for cfg_path in candidates:
+        try:
+            if not cfg_path.exists():
+                continue
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            raw = data.get("phrases") if isinstance(data, dict) else data
+            phrases: list[str] = []
+            if isinstance(raw, list):
+                for x in raw:
+                    if isinstance(x, str):
+                        s = x.strip()
+                        if s:
+                            phrases.append(s.casefold())
+            phrases = sorted(set(phrases))
+            if phrases:
+                logger.info(
+                    "Loaded refusal phrases from %s (%d items).",
+                    cfg_path,
+                    len(phrases),
+                )
+                return phrases
+        except Exception as e:
+            logger.warning(
+                "Failed to load refusal phrases from %s (%s). Will try next candidate.",
+                cfg_path,
+                e,
+            )
+    logger.info(
+        "Refusal phrases config not found/invalid. Using defaults (%d).",
+        len(_DEFAULT_REFUSAL_PHRASES),
+    )
+    return [s.casefold() for s in _DEFAULT_REFUSAL_PHRASES if s.strip()]
+
+
+_REFUSAL_PHRASES: list[str] = _load_refusal_phrases()
+
+# -------------------- Typer app --------------------
+
+app = typer.Typer(add_completion=False, help="CLI-инструмент для работы с API hh.ru")
 
 # Typer defaults as module-level constants to avoid B008 in function signature
 ARG_IDS_FILE = typer.Argument(
@@ -308,7 +390,7 @@ def oauth_import(
             expires_in = int(base["expires_in"])
         except Exception:
             expires_in = None
-    elif "access_expires_at" in base and base["access_expires_at"]:
+    elif "access_expires_at" in base and base["access_expires_at"] is not None:
         try:
             exp_at = int(base["access_expires_at"])
             expires_in = max(0, exp_at - int(time.time()))
@@ -334,8 +416,6 @@ def oauth_refresh():
 @app.command("me")
 def cmd_me():
     """Проверка токена: кто я (/me)."""
-    from hhcli.http import request
-
     data = request("GET", "/me", auth=True)
     typer.echo(json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -654,7 +734,7 @@ def cmd_export(
         # CSV: сформируем динамический заголовок по всем встреченным ключам
         all_keys: list[str] = []
         for r in rows:
-            for k in r:  # было r.keys()
+            for k in r:
                 if k not in all_keys:
                     all_keys.append(k)
         with path.open("w", encoding="utf-8", newline="") as f:
@@ -726,7 +806,7 @@ def cmd_respond(
     typer.echo(json.dumps(resp, ensure_ascii=False, indent=2))
 
 
-_REFUSED_STATES = {"rejected", "refused", "declined", "finished", "employer_refused", "discarded"}
+# -------------------- Вспомогательные для переговоров --------------------
 
 
 def _iter_negotiations(per_page: int = 100):
@@ -746,22 +826,78 @@ def _iter_negotiations(per_page: int = 100):
         page += 1
 
 
+def _normalize_text(s: str | None) -> str:
+    return (s or "").strip().casefold()
+
+
+def _text_has_refusal(text: str) -> bool:
+    t = _normalize_text(text)
+    if not t:
+        return False
+    return any(p in t for p in _REFUSAL_PHRASES)
+
+
+def _fetch_last_message_text(neg: dict) -> str:
+    """
+    Тянем последнюю запись из /negotiations/{id}/messages.
+    Используем messages_url, если он уже в элементе.
+    """
+    neg_id = str(neg.get("id") or neg.get("negotiation_id") or "")
+    url = (neg.get("messages_url") or "").strip()
+    if not url:
+        if not neg_id:
+            return ""
+        url = f"/negotiations/{neg_id}/messages"
+
+    try:
+        data = request("GET", url, auth=True) or {}
+        items = data.get("items") or []
+        if not items:
+            return ""
+        last = items[-1]  # обычно по времени возрастают
+        txt = last.get("text") or ""
+        # Лог усечённого текста для отладки/обоснования
+        short = _normalize_text(txt)[:300]
+        logger.debug(
+            "neg#%s last_message_api='%s' refused_by_api=%s", neg_id, short, _text_has_refusal(txt)
+        )
+        return txt or ""
+    except Exception as e:
+        logger.debug("neg#%s messages fetch error: %s", neg_id, e)
+        return ""
+
+
 def _is_refused(neg: dict) -> bool:
+    """
+    Логика:
+      1) state.id ∈ _REFUSED_STATES (учитываем dict/str)
+      2) иначе проверяем послед. сообщение по фразам (JSON + дефолты)
+    """
     state = neg.get("state")
-    if isinstance(state, str):
-        is_ref = state.lower() in _REFUSED_STATES
+    sid = ""
+    if isinstance(state, dict):
+        sid = _normalize_text(state.get("id"))
+    elif isinstance(state, str):
+        sid = _normalize_text(state)
+
+    if sid:
+        is_ref = sid in _REFUSED_STATES
         logger.debug(
             "neg#%s state=%s -> refused=%s",
             neg.get("id") or neg.get("negotiation_id"),
-            state,
+            sid,
             is_ref,
         )
         if is_ref:
             return True
+
+    # 2) Фразы в последнем сообщении
+    # Сначала берём, если уже есть предзаполненное last_message
     last = (neg.get("last_message") or {}).get("text") or ""
-    is_ref = isinstance(last, str) and "отказ" in last.lower()
-    logger.debug("neg#%s last_has_otkaz=%s", neg.get("id") or neg.get("negotiation_id"), is_ref)
-    return is_ref
+    if not last:
+        last = _fetch_last_message_text(neg)
+
+    return _text_has_refusal(last)
 
 
 def _close_or_archive_negotiation(neg_id: str) -> tuple[bool, str]:
@@ -788,6 +924,9 @@ def _leave_negotiation(neg_id: str) -> tuple[bool, str]:
             return True, "left"
         except Exception as err2:
             return False, f"{err1} | {err2}"
+
+
+# -------------------- Команды по переговорам --------------------
 
 
 # 1) Очистка откликов с отказами
@@ -900,4 +1039,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-# === end of respond-mass ===
