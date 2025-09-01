@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Annotated, Any
@@ -21,9 +22,10 @@ from hhcli.api import (
 )
 from hhcli.auth import build_oauth_url, exchange_code, refresh_access_token, set_tokens
 from hhcli.config import load_config, save_config
+from hhcli.http import request
 from hhcli.logs import setup_logging
-from hhcli.respond import (
-    CSV_HEADERS,
+from hhcli.respond.constants import CSV_HEADERS
+from hhcli.respond.mass_utils import (
     get_vacancy_meta,
     read_ids_from_file,
     resume_allowed_for_vacancy,
@@ -34,7 +36,10 @@ from hhcli.respond import (
 from hhcli.respond.types import RespondResult as _RespondMassResult
 from hhcli.utils import build_text_query, format_salary, paginate_vacancies
 
+_REFUSED_STATES = {"rejected", "refused", "declined", "finished", "employer_refused", "discarded"}
+
 setup_logging()
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(add_completion=False, help="CLI-инструмент для работы с API hh.ru")
 
@@ -719,6 +724,171 @@ def cmd_respond(
             pass
         raise
     typer.echo(json.dumps(resp, ensure_ascii=False, indent=2))
+
+
+_REFUSED_STATES = {"rejected", "refused", "declined", "finished", "employer_refused", "discarded"}
+
+
+def _iter_negotiations(per_page: int = 100):
+    logger.debug("iter_negotiations: start per_page=%d", per_page)
+    page = 0
+    while True:
+        logger.debug("iter_negotiations: GET /negotiations page=%d", page)
+        data = request(
+            "GET", "/negotiations", params={"page": page, "per_page": per_page}, auth=True
+        )
+        items = (data or {}).get("items") or []
+        logger.debug("iter_negotiations: page=%d items=%d", page, len(items))
+        yield from items
+        if not items or (data.get("page", page) >= data.get("pages", page)):
+            logger.debug("iter_negotiations: stop")
+            break
+        page += 1
+
+
+def _is_refused(neg: dict) -> bool:
+    state = neg.get("state")
+    if isinstance(state, str):
+        is_ref = state.lower() in _REFUSED_STATES
+        logger.debug(
+            "neg#%s state=%s -> refused=%s",
+            neg.get("id") or neg.get("negotiation_id"),
+            state,
+            is_ref,
+        )
+        if is_ref:
+            return True
+    last = (neg.get("last_message") or {}).get("text") or ""
+    is_ref = isinstance(last, str) and "отказ" in last.lower()
+    logger.debug("neg#%s last_has_otkaz=%s", neg.get("id") or neg.get("negotiation_id"), is_ref)
+    return is_ref
+
+
+def _close_or_archive_negotiation(neg_id: str) -> tuple[bool, str]:
+    """Закрыть или (если не получилось) заархивировать переговоры."""
+    try:
+        request("POST", f"/negotiations/{neg_id}/close", auth=True)
+        return True, "closed"
+    except Exception as err1:
+        try:
+            request("POST", f"/negotiations/{neg_id}/archive", auth=True)
+            return True, "archived"
+        except Exception as err2:
+            return False, f"{err1} | {err2}"
+
+
+def _leave_negotiation(neg_id: str) -> tuple[bool, str]:
+    """Выйти из переговоров."""
+    try:
+        request("POST", f"/negotiations/{neg_id}/leave", auth=True)
+        return True, "left"
+    except Exception as err1:
+        try:
+            request("DELETE", f"/negotiations/{neg_id}/participants/me", auth=True)
+            return True, "left"
+        except Exception as err2:
+            return False, f"{err1} | {err2}"
+
+
+# 1) Очистка откликов с отказами
+@app.command("negotiations-clean-refused")
+def negotiations_clean_refused(
+    limit: int = typer.Option(
+        0, "--limit", help="Ограничить количество закрытых переписок (0 — без ограничения)."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Только показать, без действий."),
+) -> None:
+    total = 0
+    done = 0
+    errors = 0
+    for neg in _iter_negotiations():
+        neg_id = str(neg.get("id") or neg.get("negotiation_id") or "")
+        if not neg_id or not _is_refused(neg):
+            continue
+        total += 1
+        prefix = f"[{total}] neg#{neg_id} "
+        if dry_run:
+            typer.secho(prefix + "would close (dry-run)", fg=typer.colors.BLUE)
+        else:
+            ok, msg = _close_or_archive_negotiation(neg_id)
+            if ok:
+                done += 1
+                typer.secho(prefix + msg, fg=typer.colors.GREEN)
+            else:
+                errors += 1
+                typer.secho(prefix + f"error: {msg}", fg=typer.colors.RED)
+        if limit and done >= limit:
+            break
+    typer.secho(
+        f"Processed: {total}; closed: {done}; errors: {errors}",
+        fg=typer.colors.GREEN if errors == 0 else typer.colors.YELLOW,
+    )
+
+
+# 2) Выход из чатов с отказами
+@app.command("negotiations-leave-refused")
+def negotiations_leave_refused(
+    limit: int = typer.Option(
+        0, "--limit", help="Ограничить количество выходов (0 — без ограничения)."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Только показать, без действий."),
+) -> None:
+    total = 0
+    done = 0
+    errors = 0
+    for neg in _iter_negotiations():
+        neg_id = str(neg.get("id") or neg.get("negotiation_id") or "")
+        if not neg_id or not _is_refused(neg):
+            continue
+        total += 1
+        prefix = f"[{total}] neg#{neg_id} "
+        if dry_run:
+            typer.secho(prefix + "would leave (dry-run)", fg=typer.colors.BLUE)
+        else:
+            ok, msg = _leave_negotiation(neg_id)
+            if ok:
+                done += 1
+                typer.secho(prefix + msg, fg=typer.colors.GREEN)
+            else:
+                errors += 1
+                typer.secho(prefix + f"error: {msg}", fg=typer.colors.RED)
+        if limit and done >= limit:
+            break
+    typer.secho(
+        f"Processed: {total}; left: {done}; errors: {errors}",
+        fg=typer.colors.GREEN if errors == 0 else typer.colors.YELLOW,
+    )
+
+
+# 3) Автоподнятие резюме
+@app.command("resume-autoraise")
+def resume_autoraise(
+    resume_id: str = typer.Argument(..., help="ID резюме для автоподнятия"),
+    interval_hours: float = typer.Option(
+        4.0, "--interval-hours", min=0.5, help="Интервал автоподнятия в часах."
+    ),
+    loop: bool = typer.Option(
+        False, "--loop/--one-shot", help="Запускать в цикле (держит процесс)."
+    ),
+) -> None:
+    def _raise_once() -> bool:
+        try:
+            request("POST", f"/resumes/{resume_id}/publish", auth=True)
+            typer.secho("Resume published (raised).", fg=typer.colors.GREEN)
+            return True
+        except Exception as err:
+            typer.secho(f"Failed to publish resume: {err}", fg=typer.colors.RED)
+            return False
+
+    ok = _raise_once()
+    if not loop:
+        raise typer.Exit(0 if ok else 1)
+
+    seconds = max(1, int(interval_hours * 3600))
+    typer.secho(f"Loop mode: will raise every {seconds} seconds.", fg=typer.colors.BLUE)
+    while True:
+        time.sleep(seconds)
+        _raise_once()
 
 
 # -------------------- Entry --------------------

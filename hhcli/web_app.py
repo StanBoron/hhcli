@@ -813,6 +813,152 @@ def respond_ui() -> None:
                     st.error(f"Ошибка массового отклика: {err}")
 
 
+# ===== Обслуживание откликов и резюме =====
+st.header("Обслуживание откликов и резюме")
+
+with st.expander("1) Очистка откликов с отказами"):
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        limit_refused = st.number_input(
+            "Лимит закрытий", min_value=0, value=0, step=1, help="0 — без ограничения"
+        )
+        dry_run_refused = st.checkbox("Только показать (dry-run)", value=True)
+    run_clean = st.button("Запустить закрытие/архивацию отказов")
+
+    def _iter_neg(per_page: int = 100):
+        page = 0
+        while True:
+            try:
+                data = request(
+                    "GET", "/negotiations", params={"page": page, "per_page": per_page}, auth=True
+                )
+            except Exception as e:
+                st.error(f"Ошибка запроса /negotiations: {e}")
+                break
+            items = (data or {}).get("items") or []
+            # UP028: вместо цикла — yield from
+            yield from items
+            if not items or (data.get("page", page) >= data.get("pages", page)):
+                break
+            page += 1
+
+    def _is_refused_web(neg: dict) -> bool:
+        state = neg.get("state")
+        if isinstance(state, str) and state.lower() in {
+            "rejected",
+            "refused",
+            "declined",
+            "finished",
+            "employer_refused",
+            "discarded",
+        }:
+            return True
+
+        # если state — словарь или что-то другое
+        last = (neg.get("last_message") or {}).get("text") or ""
+        return isinstance(last, str) and "отказ" in last.lower()
+
+    if run_clean:
+        rows = []
+        done = 0
+        progress = st.progress(0.0)
+        total_checked = 0
+        for neg in _iter_neg():
+            total_checked += 1
+            neg_id = str(neg.get("id") or neg.get("negotiation_id") or "")
+            if not neg_id or not _is_refused_web(neg):
+                continue
+            if dry_run_refused:
+                rows.append({"negotiation_id": neg_id, "action": "would close (dry-run)"})
+            else:
+                ok = True
+                msg = "closed"
+                try:
+                    request("POST", f"/negotiations/{neg_id}/close", auth=True)
+                except Exception as err1:
+                    try:
+                        request("POST", f"/negotiations/{neg_id}/archive", auth=True)
+                        msg = "archived"
+                    except Exception as err2:
+                        ok = False
+                        msg = f"{err1} | {err2}"
+                rows.append({"negotiation_id": neg_id, "action": msg, "ok": ok})
+                if ok:
+                    done += 1
+            if limit_refused and done >= limit_refused:
+                break
+            progress.progress(min(0.99, total_checked / 200.0))
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.success(f"Готово: завершено {done} переписок.")
+
+with st.expander("2) Выйти из чатов с отказами"):
+    limit_leave = st.number_input(
+        "Лимит выходов",
+        min_value=0,
+        value=0,
+        step=1,
+        help="0 — без ограничения",
+        key="limit_leave",
+    )
+    dry_run_leave = st.checkbox("Только показать (dry-run)", value=True, key="dry_run_leave")
+    run_leave = st.button("Выйти из чатов с отказами")
+
+    def _leave_neg_web(neg_id: str) -> tuple[bool, str]:
+        try:
+            request("POST", f"/negotiations/{neg_id}/leave", auth=True)
+            return True, "left"
+        except Exception as err1:
+            try:
+                request("DELETE", f"/negotiations/{neg_id}/participants/me", auth=True)
+                return True, "left"
+            except Exception as err2:
+                return False, f"{err1} | {err2}"
+
+    if run_leave:
+        rows = []
+        done = 0
+        total_checked = 0
+        progress = st.progress(0.0)
+        for neg in _iter_neg():
+            total_checked += 1
+            neg_id = str(neg.get("id") or neg.get("negotiation_id") or "")
+            if not neg_id or not _is_refused_web(neg):
+                continue
+            if dry_run_leave:
+                rows.append({"negotiation_id": neg_id, "action": "would leave (dry-run)"})
+            else:
+                ok, msg = _leave_neg_web(neg_id)
+                rows.append({"negotiation_id": neg_id, "action": msg, "ok": ok})
+                if ok:
+                    done += 1
+            if limit_leave and done >= limit_leave:
+                break
+            progress.progress(min(0.99, total_checked / 200.0))
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.success(f"Готово: вышел из {done} чатов.")
+
+with st.expander("3) Поднять резюме сейчас"):
+    resume_id_raise = st.text_input("ID резюме для поднятия", key="resume_raise_id")
+    colA, colB = st.columns([1, 1])
+    with colA:
+        if st.button("Поднять резюме сейчас", type="primary"):
+            if not resume_id_raise.strip():
+                st.warning("Укажите ID резюме.")
+            else:
+                try:
+                    request("POST", f"/resumes/{resume_id_raise}/publish", auth=True)
+                    st.success("Резюме поднято.")
+                except Exception as e:
+                    st.error(f"Ошибка поднятия резюме: {e}")
+    with colB:
+        st.info(
+            "Для автоподнятия каждые 4 часа используйте CLI:\n\n"
+            "`hhcli resume-autoraise <RESUME_ID> --loop --interval-hours 4`"
+        )
+
+
 # ========================= Main =========================
 def main():
     st.title("HH.ru — Web Search (Streamlit)")
