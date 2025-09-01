@@ -22,12 +22,156 @@ from hhcli.api import (
 from hhcli.auth import build_oauth_url, exchange_code, refresh_access_token, set_tokens
 from hhcli.config import load_config, save_config
 from hhcli.logs import setup_logging
+from hhcli.respond import (
+    CSV_HEADERS,
+    get_vacancy_meta,
+    read_ids_from_file,
+    resume_allowed_for_vacancy,
+    send_response,
+    vacancy_has_required_test,
+    vacancy_requires_letter,
+)
+from hhcli.respond.types import RespondResult as _RespondMassResult
 from hhcli.utils import build_text_query, format_salary, paginate_vacancies
 
 setup_logging()
 
 app = typer.Typer(add_completion=False, help="CLI-инструмент для работы с API hh.ru")
 
+
+# Typer defaults as module-level constants to avoid B008 in function signature
+ARG_IDS_FILE = typer.Argument(
+    ..., exists=True, readable=True, help="Файл со списком вакансий (.txt/.csv/.tsv/.jsonl)"
+)
+ARG_RESUME_ID = typer.Argument(..., help="ID резюме, которым откликаться")
+OPT_MESSAGE = typer.Option(None, "--message", "-m", help="Сопроводительное письмо")
+OPT_MESSAGE_FILE = typer.Option(
+    None, "--message-file", "-mf", exists=True, readable=True, help="Файл с письмом (UTF-8)"
+)
+OPT_ONLY_CAN_RESPOND = typer.Option(
+    False, "--only-can-respond/--no-only-can-respond", help="Проверять доступность резюме"
+)
+OPT_SKIP_TESTED = typer.Option(
+    True, "--skip-tested/--no-skip-tested", help="Пропускать вакансии с обязательным тестом"
+)
+OPT_REQUIRE_LETTER = typer.Option(
+    True,
+    "--require-letter/--no-require-letter",
+    help="Если у вакансии обязательно письмо — не отправлять без него",
+)
+OPT_RATE_LIMIT = typer.Option(0.7, "--rate-limit", min=0.0, help="Пауза между запросами, сек")
+OPT_LIMIT = typer.Option(None, "--limit", min=1, help="Ограничить число откликов")
+OPT_DRY_RUN = typer.Option(False, "--dry-run", help="Без отправки, только отчёт")
+OPT_OUT = typer.Option(None, "--out", "-o", help="CSV-отчёт")
+
+
+# === respond-mass: command (using shared utils) ===
+@app.command("respond-mass")
+def respond_mass(
+    ids_file: Path = ARG_IDS_FILE,
+    resume_id: str = ARG_RESUME_ID,
+    message: str | None = OPT_MESSAGE,
+    message_file: Path | None = OPT_MESSAGE_FILE,
+    only_can_respond: bool = OPT_ONLY_CAN_RESPOND,
+    skip_tested: bool = OPT_SKIP_TESTED,
+    require_letter: bool = OPT_REQUIRE_LETTER,
+    rate_limit: float = OPT_RATE_LIMIT,
+    limit: int | None = OPT_LIMIT,
+    dry_run: bool = OPT_DRY_RUN,
+    out: Path | None = OPT_OUT,
+) -> None:
+    """Массовые отклики на вакансии."""
+    # message from file (B904: chain exception)
+    if message_file:
+        try:
+            with message_file.open("r", encoding="utf-8") as f:
+                message = f.read().strip()
+        except Exception as err:
+            typer.secho(f"Не удалось прочитать message_file: {err}", fg=typer.colors.RED)
+            raise typer.Exit(2) from err
+
+    # Load IDs
+    try:
+        ids = read_ids_from_file(ids_file)
+    except Exception as err:
+        typer.secho(f"Ошибка чтения списка ID: {err}", fg=typer.colors.RED)
+        raise typer.Exit(2) from err
+
+    if not ids:
+        typer.secho("Список вакансий пуст.", fg=typer.colors.YELLOW)
+        raise typer.Exit(0)
+
+    if limit is not None:
+        ids = ids[:limit]
+
+    typer.secho(f"К отклику подготовлено {len(ids)} вакансий.", fg=typer.colors.GREEN)
+
+    results: list[_RespondMassResult] = []
+
+    for idx, vacancy_id in enumerate(ids, start=1):
+        prefix = f"[{idx}/{len(ids)}] #{vacancy_id} "
+        meta = get_vacancy_meta(vacancy_id)
+
+        if skip_tested and vacancy_has_required_test(meta):
+            typer.secho(prefix + "пропущено: обязательный тест", fg=typer.colors.YELLOW)
+            results.append(_RespondMassResult(vacancy_id=vacancy_id, status="skipped_test"))
+            continue
+
+        if require_letter and vacancy_requires_letter(meta) and not message:
+            typer.secho(
+                prefix + "пропущено: требуется сопроводительное письмо", fg=typer.colors.YELLOW
+            )
+            results.append(_RespondMassResult(vacancy_id=vacancy_id, status="skipped_no_letter"))
+            continue
+
+        if only_can_respond and not resume_allowed_for_vacancy(vacancy_id, resume_id):
+            typer.secho(prefix + "пропущено: резюме не допускается", fg=typer.colors.YELLOW)
+            results.append(_RespondMassResult(vacancy_id=vacancy_id, status="skipped_cannot"))
+            continue
+
+        if dry_run:
+            typer.secho(prefix + "OK (dry-run)", fg=typer.colors.BLUE)
+            results.append(_RespondMassResult(vacancy_id=vacancy_id, status="dry_run"))
+        else:
+            res = send_response(vacancy_id, resume_id, message)
+            if res.status == "ok":
+                typer.secho(prefix + "отправлено", fg=typer.colors.GREEN)
+            else:
+                typer.secho(prefix + f"ошибка: {res.error}", fg=typer.colors.RED)
+            results.append(res)
+
+        if rate_limit > 0 and idx < len(ids):
+            time.sleep(rate_limit)
+
+    # SIM115: context manager
+    if out:
+        with out.open("w", encoding="utf-8", newline="") as f_out:
+            writer = csv.writer(f_out)
+            writer.writerow(CSV_HEADERS)
+            for r in results:
+                writer.writerow(
+                    [
+                        r.vacancy_id,
+                        r.status,
+                        r.http_code or "",
+                        r.negotiation_id or "",
+                        r.error or "",
+                        r.request_id or "",
+                    ]
+                )
+
+    exit_code = (
+        0
+        if all(
+            r.status in {"ok", "dry_run", "skipped_test", "skipped_no_letter", "skipped_cannot"}
+            for r in results
+        )
+        else 1
+    )
+    raise typer.Exit(exit_code)
+
+
+# === end of respond-mass ===
 
 # -------------------- Конфиг и OAuth --------------------
 
@@ -586,3 +730,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+# === end of respond-mass ===

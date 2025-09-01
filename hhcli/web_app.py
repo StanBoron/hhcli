@@ -690,7 +690,7 @@ def respond_ui() -> None:
                 st.success("Отклик отправлен.")
             except Exception as err:
                 log.exception("[RESPOND_SINGLE] FAILED err=%s", err)
-                import requests as _rq  # noqa: WPS433
+                import requests as _rq
 
                 if isinstance(err, _rq.HTTPError) and getattr(err, "response", None) is not None:
                     st.error(f"HTTP {err.response.status_code}: {err.response.text}")
