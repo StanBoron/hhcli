@@ -2,32 +2,42 @@ name: CI
 
 on:
   push:
+    branches: [ "**" ]
+    tags: [ "v*" ]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME_API: ${{ github.repository }}-api
+  IMAGE_NAME_WEB: ${{ github.repository }}-web
+
 jobs:
-  test:
+  backend-tests:
+    name: Backend (ruff/black/pytest) on py${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: "pip"
+          cache: pip
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install -U pip
-          # Ставим проект с extras для веба и разработки
-          pip install -e ".[web,dev]"
-          # Страховка: если extras не подтянулись (разные версии pip/PEP 621 и т.д.)
+          # проект с extras (поддерживает твой текущий workflow)
+          pip install -e ".[web,dev]" || true
           pip install --upgrade --upgrade-strategy eager ruff black pytest
 
       - name: Show versions
@@ -44,5 +54,133 @@ jobs:
       - name: Format check (black)
         run: black --check hhcli
 
-      - name: Run tests (pytest)
+      - name: Tests (pytest)
         run: pytest -q
+
+  web-build:
+    name: Web (tsc/eslint/build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: CI install
+        run: npm ci
+
+      - name: Type check (tsc -b)
+        run: npx tsc -b
+
+      - name: Lint (eslint)
+        run: npm run lint --if-present
+
+      - name: Build (vite)
+        run: npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  docker:
+    name: Docker build & push (+smoke test)
+    runs-on: ubuntu-latest
+    needs: [backend-tests, web-build]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tag
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "TAG=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "TAG=latest" >> $GITHUB_OUTPUT
+          else
+            # короткий тег для фич-веток
+            SAFE_TAG=$(echo "${GITHUB_REF_NAME}" | tr '/' '-' )
+            echo "TAG=${SAFE_TAG}" >> $GITHUB_OUTPUT
+          fi
+
+      # Собираем API
+      - name: Build & push API
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/api.Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ steps.meta.outputs.TAG }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:buildcache,mode=max
+
+      # Собираем Web
+      - name: Build & push Web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/web.Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}:${{ steps.meta.outputs.TAG }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}:buildcache,mode=max
+
+      # Smoke-test: поднимаем опубликованные образы и пингуем health
+      - name: Smoke test with compose
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.TAG }}
+        run: |
+          cat > compose.ci.yaml <<'YAML'
+          services:
+            api:
+              image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ env.TAG }}
+              environment:
+                HH_CLIENT_ID: ${{ secrets.HH_CLIENT_ID }}
+                HH_CLIENT_SECRET: ${{ secrets.HH_CLIENT_SECRET }}
+                HH_REDIRECT_URI: ${{ secrets.HH_REDIRECT_URI }}
+                HH_USER_AGENT: ${{ secrets.HH_USER_AGENT }}
+              ports: ["5179:5179"]
+            web:
+              image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}:${{ env.TAG }}
+              depends_on: [api]
+              ports: ["8501:8501"]
+          YAML
+          docker compose -f compose.ci.yaml up -d
+          # ждём API
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:5179/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:5179/api/health
+          curl -fsS http://127.0.0.1:8501/ | head -n1
+          docker compose -f compose.ci.yaml down -v
