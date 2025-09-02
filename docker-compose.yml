@@ -1,0 +1,52 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hhcli_api
+    environment:
+      # то, что нужно твоим модулям auth/utils (если используешь)
+      HH_CLIENT_ID: ${HH_CLIENT_ID}
+      HH_CLIENT_SECRET: ${HH_CLIENT_SECRET}
+      HH_REDIRECT_URI: ${HH_REDIRECT_URI}
+      HH_USER_AGENT: ${HH_USER_AGENT:-hhcli/1.0}
+    volumes:
+      - hhcli_data:/root/.hhcli  # сохраняем токены/конфиг
+    ports:
+      - "5179:5179"
+    networks:
+      - hhnet
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    container_name: hhcli_web
+    depends_on:
+      - api
+    ports:
+      - "8501:8501"
+    networks:
+      - hhnet
+
+  # Раскомментируй, когда будешь подключать БД
+  # db:
+  #   image: postgres:16-alpine
+  #   container_name: hhcli_db
+  #   environment:
+  #     POSTGRES_DB: ${DB_NAME:-hhcli}
+  #     POSTGRES_USER: ${DB_USER:-hhcli}
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD:-hhcli}
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   networks:
+  #     - hhnet
+
+volumes:
+  hhcli_data:
+  # pg_data:
+
+networks:
+  hhnet:

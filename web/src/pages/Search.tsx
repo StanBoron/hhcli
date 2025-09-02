@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import type { AxiosError } from "axios";
 import { api } from "../lib/api";
@@ -8,6 +8,7 @@ import { useSettings } from "../store/settings";
 import { useLocalStorage } from "../lib/useLocalStorage";
 import Skeleton from "../components/Skeleton";
 import { useQuerySync } from "../lib/useQuerySync";
+import { useNavigate } from "react-router-dom";
 
 type Vacancy = {
   id: string;
@@ -53,6 +54,27 @@ export default function Search() {
 
   // дебаунс для авто-поиска
   const [typing, setTyping] = useState(false);
+  const {
+    data,
+    isFetching,
+    refetch,
+    error: queryError,
+  } = useQuery({
+    queryKey: ["search", { text, area, per_page: perPage, page }],
+    queryFn: async (): Promise<SearchResult> => {
+      const payload = {
+        text: text.trim() || undefined,
+        area: area || undefined,
+        per_page: perPage,
+        page,
+      };
+      const r = await api.post("/search", payload);
+      return r.data?.data ?? r.data;
+    },
+    enabled: false,
+    staleTime: 30_000,
+  });
+
   useEffect(() => {
     if (!auto) return;
     setTyping(true);
@@ -64,36 +86,24 @@ export default function Search() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, area, perPage, sort]);
 
-  const payload = useMemo(
-    () => ({
-      text: text.trim() || undefined,
-      area: area || undefined,
-      per_page: perPage,
-      page,
-    }),
-    [text, area, perPage, page]
-  );
-
-  const {
-    data,
-    isFetching,
-    refetch,
-    error: queryError,
-  } = useQuery({
-    queryKey: ["search", payload],
-    queryFn: async (): Promise<SearchResult> => {
-      const r = await api.post("/search", payload);
-      return r.data?.data ?? r.data;
-    },
-    enabled: false,
-    staleTime: 30_000,
-  });
-
   // первый автозапрос при открытии
   useEffect(() => {
     if (auto) refetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // рефетч при смене страницы
+  useEffect(() => {
+    refetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
+
+  // при изменении perPage — сброс страницы и (если auto) запрос
+  useEffect(() => {
+    setPage(0);
+    if (auto) refetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [perPage]);
 
   const total = data?.found ?? 0;
   const pages = data?.pages ?? 0;
@@ -144,6 +154,7 @@ export default function Search() {
       return next;
     });
   };
+  const navigate = useNavigate();
 
   // массовый отклик
   const massRespond = useMutation({
@@ -241,6 +252,13 @@ export default function Search() {
         {total > 0 && <div className="text-sm opacity-80">{total} found</div>}
         {detailError && <div className="text-sm text-red-600">error: {detailError}</div>}
       </div>
+      <button
+        className="px-3 py-1 border rounded"
+        disabled={items.length === 0}
+        onClick={() => navigate("/respond-mass", { state: { ids: items.map((i) => i.id) } })}
+      >
+        Use current page IDs
+      </button>
 
       {/* bulk toolbar */}
       <div className="flex items-center gap-3 flex-wrap border rounded p-2">

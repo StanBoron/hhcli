@@ -1,0 +1,9 @@
+services:
+  opener:
+    image: python:3.12-slim
+    depends_on:
+      - web
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python open_browser.py
