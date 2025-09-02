@@ -1,19 +1,28 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-hhcli}
+      POSTGRES_USER: ${DB_USER:-hhcli}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-hhcli}
+    ports:
+      - "5432:5432"           # опционально, для локального доступа
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks: [ hhnet ]
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: hhcli_api
-    environment:
-      # то, что нужно твоим модулям auth/utils (если используешь)
-      HH_CLIENT_ID: ${HH_CLIENT_ID}
-      HH_CLIENT_SECRET: ${HH_CLIENT_SECRET}
-      HH_REDIRECT_URI: ${HH_REDIRECT_URI}
-      HH_USER_AGENT: ${HH_USER_AGENT:-hhcli/1.0}
+    env_file:
+      - .env
     volumes:
       - hhcli_data:/root/.hhcli  # сохраняем токены/конфиг
     ports:
       - "5179:5179"
+    depends_on:
+      - db
     networks:
       - hhnet
 
@@ -45,8 +54,8 @@ services:
   #     - hhnet
 
 volumes:
-  hhcli_data:
-  # pg_data:
+  pg_data:
+  hhcli_data: {}
 
 networks:
   hhnet:

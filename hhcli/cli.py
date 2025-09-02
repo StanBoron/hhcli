@@ -6,7 +6,7 @@ import logging
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any, List, Dict, Optional
+from typing import Annotated, Any
 
 import typer
 
@@ -456,7 +456,9 @@ def cmd_me():
 
 
 # -------------------- Справочники --------------------
-def dicts_areas(*, parent: Optional[int] = None, flat: bool = True) -> List[Dict[str, Any]] | Dict[str, Any]:
+def dicts_areas(
+    *, parent: int | None = None, flat: bool = True
+) -> list[dict[str, Any]] | dict[str, Any]:
     """
     Справочник регионов/городов hh.ru.
     - parent=None: страны верхнего уровня (или всё дерево, если flat=False)
@@ -468,13 +470,15 @@ def dicts_areas(*, parent: Optional[int] = None, flat: bool = True) -> List[Dict
         tree = areas_api.get_areas_tree()
         if not flat:
             return tree
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
+
         def walk(nodes, parent_id=None):
             for n in nodes:
                 out.append({"id": n["id"], "name": n["name"], "parent_id": parent_id})
                 childs = n.get("areas") or []
                 if childs:
                     walk(childs, n["id"])
+
         walk(tree)
         return out
     else:
@@ -483,6 +487,7 @@ def dicts_areas(*, parent: Optional[int] = None, flat: bool = True) -> List[Dict
         if flat:
             return [{"id": ch["id"], "name": ch["name"], "parent_id": parent} for ch in children]
         return children
+
 
 @app.command("areas")
 def cmd_areas(
